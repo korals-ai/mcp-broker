@@ -1,0 +1,50 @@
+[project]
+name = "mcp-broker"
+version = "0.1.0"
+description = "An MCP gateway for tool servers that are not up yet: upstreams appear mid-session instead of blocking startup."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = ["mcp>=1.2,<2", "starlette>=0.37"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "pytest-cov", "ruff", "mypy", "pip-audit", "httpx", "uvicorn"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mcp_broker*"]
+
+# PEP 561: without this marker, a consumer's mypy treats every import from this
+# package as untyped and refuses it under disallow_untyped_defs.
+[tool.setuptools.package-data]
+mcp_broker = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Kept in step with the application this package was extracted from, so the same
+# source passes both gates without reflowing working code.
+select = ["E", "F", "W", "I", "B", "S", "UP", "SIM", "RUF", "ASYNC", "PERF", "RET"]
+ignore = ["E501", "B008", "S101", "SIM108", "UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S108", "S603", "S607"]
+
+[tool.mypy]
+# Same level as the application this was extracted from. Full `strict` fails on
+# the MCP SDK's own untyped decorators, which is not a defect in this code.
+python_version = "3.12"
+files = ["mcp_broker"]
+disallow_untyped_defs = true
+check_untyped_defs = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

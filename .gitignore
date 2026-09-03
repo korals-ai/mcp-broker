@@ -1,0 +1,10 @@
+# Artifacts of ./pre_build.sh. This file travels with the public mirror, where
+# there is no repo-root .gitignore to fall back on.
+.venv/
+__pycache__/
+*.pyc
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/

@@ -1,0 +1,9 @@
+# Runtime dependencies for the mcp-broker library.
+
+# The MCP SDK: the low-level Server the broker presents per upstream, the
+# Streamable HTTP session manager it mounts, and the client it dials with.
+mcp>=1.2,<2
+
+# ASGI types + the Mount the broker's route is designed to hang off. The broker
+# does not run a server itself — the host application does.
+starlette>=0.37
