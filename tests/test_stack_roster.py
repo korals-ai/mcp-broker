@@ -31,7 +31,11 @@ def _compose_ports() -> dict[str, int]:
         if m:
             service = m.group(1)
             continue
-        m = re.match(r'^\s+ports:\s*\["(\d+):(\d+)"\]', line)
+        # Full-line anchor: a service growing a SECOND mapping must fail here,
+        # not pass with the extra mapping unvalidated.
+        m = re.match(r'^\s+ports:\s*\["(\d+):(\d+)"\]\s*$', line)
+        if m is None and re.match(r"^\s+ports:", line):
+            raise AssertionError(f"unparseable ports line (second mapping?): {line!r}")
         if m and service:
             assert m.group(1) == m.group(2), f"{service}: host and container ports differ"
             ports[service] = int(m.group(1))

@@ -2,7 +2,10 @@
 
 # The MCP SDK: the low-level Server the broker presents per upstream, the
 # Streamable HTTP session manager it mounts, and the client it dials with.
-mcp>=1.2,<2
+# Floor 1.9: streamablehttp_client and StreamableHTTPSessionManager do not
+# exist before it, so a resolver free to pick an older 1.x breaks the import.
+# Ceiling <2: mcp 2.0 renames streamablehttp_client -> streamable_http_client.
+mcp>=1.9,<2
 
 # ASGI types + the Mount the broker's route is designed to hang off. The broker
 # does not run a server itself — the host application does.
