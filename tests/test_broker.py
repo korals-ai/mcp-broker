@@ -127,7 +127,7 @@ async def test_dial_url_uses_ampersand_when_url_already_has_a_query() -> None:
 
 
 async def test_call_sends_a_fresh_request_id_header_every_time() -> None:
-    """Correlating one call across annexa's own logs and an external
+    """Correlating one call across the caller's own logs and an upstream
     provider's used to need manual wall-clock timestamp matching across two
     systems with no shared identifier — see Upstream.call's docstring."""
     dialer = _RecordingDialer()

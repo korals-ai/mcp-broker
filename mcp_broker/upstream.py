@@ -213,8 +213,9 @@ class Upstream:
             exactly the "stuck chat" this guards against.
 
         ``request_id`` is minted here, not passed in: correlating one call
-        across the platform's own logs and an external provider's (e.g. betabourse's
-        tse-agent/codal-agent) used to require manually matching wall-clock
+        across this side's own logs and a remote upstream's (one run by a
+        different team, on different infrastructure) used to require
+        manually matching wall-clock
         timestamps across two systems with no shared identifier — a real
         investigation (2026-08-05) cost significant time on exactly this. Real
         OTel trace continuity does NOT reach this call site today: the agent
