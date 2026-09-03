@@ -1,0 +1,64 @@
+# The tool servers this broker is designed to front, each built straight from its
+# own public repository — nothing to clone.
+#
+#   docker compose up -d                  # the fast ones
+#   docker compose --profile heavy up -d  # adds office, ocr and browser
+#   python examples/serve_stack.py        # the broker, in YOUR process
+#
+# The broker is deliberately NOT a service here. It is a library: it runs inside
+# the application that needs the tools, which is also why it is up the instant
+# that application is. Putting it in a container would reintroduce exactly the
+# startup ordering it exists to remove.
+#
+# You do not need all of these up. Start two, point an agent at the broker, then
+# bring up a third — its tools appear in the running session. That is the whole
+# library in one gesture.
+services:
+  cad:
+    build: { context: "https://github.com/korals-ai/mcp-cad.git" }
+    ports: ["8092:8092"]
+    volumes: ["${WORKDIR:-.}:/work"]
+    user: "${MCP_UID:-1000}:${MCP_GID:-1000}"
+    environment: { HOME: /tmp }
+
+  render:
+    build: { context: "https://github.com/korals-ai/mcp-render.git" }
+    ports: ["8095:8095"]
+    volumes: ["${WORKDIR:-.}:/work"]
+    user: "${MCP_UID:-1000}:${MCP_GID:-1000}"
+    environment: { HOME: /tmp }
+
+  ffmpeg:
+    build: { context: "https://github.com/korals-ai/mcp-ffmpeg.git" }
+    ports: ["8094:8094"]
+    volumes: ["${WORKDIR:-.}:/work"]
+    user: "${MCP_UID:-1000}:${MCP_GID:-1000}"
+    environment: { HOME: /tmp }
+
+  # Behind a profile: these three pull hundreds of MB of packages (LibreOffice,
+  # Tesseract, Chrome) and take many minutes to build the first time.
+  office:
+    profiles: ["heavy"]
+    build: { context: "https://github.com/korals-ai/mcp-office.git" }
+    ports: ["8090:8090"]
+    volumes: ["${WORKDIR:-.}:/work"]
+    user: "${MCP_UID:-1000}:${MCP_GID:-1000}"
+    environment: { HOME: /tmp }
+
+  ocr:
+    profiles: ["heavy"]
+    build: { context: "https://github.com/korals-ai/mcp-ocr.git" }
+    ports: ["8091:8091"]
+    volumes: ["${WORKDIR:-.}:/work"]
+    user: "${MCP_UID:-1000}:${MCP_GID:-1000}"
+    environment: { HOME: /tmp }
+
+  browser:
+    profiles: ["heavy"]
+    build: { context: "https://github.com/korals-ai/mcp-browser.git" }
+    ports: ["8096:8096"]
+    volumes: ["${WORKDIR:-.}:/work"]
+    user: "${MCP_UID:-1000}:${MCP_GID:-1000}"
+    environment: { HOME: /tmp }
+    # Chromium needs more shared memory than Docker's 64 MB default.
+    shm_size: 1gb

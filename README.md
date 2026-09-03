@@ -85,6 +85,34 @@ python examples/fake_upstream.py 9102
 
 Ask again. `slowly`'s tools are there. That is the whole library.
 
+## A whole toolchain, in two commands
+
+`docker-compose.yml` here brings up six real MCP tool servers — CAD, HTML→PDF,
+ffmpeg, Office documents, OCR, and a browser — each built **straight from its own
+public repository**, so there is nothing to clone:
+
+```bash
+docker compose up -d                    # cad, render, ffmpeg — quick to build
+docker compose --profile heavy up -d    # adds office, ocr, browser — slow, large
+python examples/serve_stack.py          # the broker, in your process
+```
+
+Then give an agent one endpoint per tool:
+
+```bash
+for t in cad render ffmpeg office ocr browser; do
+  claude mcp add --transport http "$t" "http://127.0.0.1:9000/_broker/$t/mcp"
+done
+```
+
+Register all six whether or not you started all six. The running ones bring
+their tools; the rest stay silent instead of offering tools that fail when
+called. Bring one up later and it joins the session you already have open.
+
+The heavy three sit behind a profile because they install LibreOffice, Tesseract
+and Chrome — hundreds of megabytes and several minutes on a first build. Start
+with the default set.
+
 ## What it does, precisely
 
 - **Confirmed-lazy `tools/list`.** An upstream's tools are advertised only after
@@ -93,7 +121,13 @@ Ask again. `slowly`'s tools are there. That is the whole library.
 - **`tools/listChanged` on arrival.** The dial loop notifies open sessions when
   an upstream first answers, so clients re-list and the tools appear.
 - **Bounded retries, then give up loudly.** The dial loop backs off to a cap and
-  stops, reporting through the metrics seam rather than retrying forever.
+  then stops, reporting through the metrics seam rather than retrying forever.
+  **This window bounds how late an upstream may arrive** — `giveup_after_s`
+  defaults to 60 seconds, which suits upstreams that start alongside your
+  application and is far too short if you might start one by hand minutes later.
+  Raise it (`giveup_after_s=` or `MCP_BROKER_GIVEUP_S`) when upstreams can arrive
+  late; a broker that has given up looks exactly like one whose upstream has not
+  started, so this is worth setting deliberately.
 - **Reachability is honest in both directions.** A probe or call that fails after
   an upstream was ready marks it not-ready again; a live upstream that drops
   reports one exit, on the edge, not one per failed call.

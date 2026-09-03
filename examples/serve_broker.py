@@ -37,7 +37,13 @@ ROSTER = [
 
 
 def build() -> Starlette:
-    broker = ToolBroker.from_env(ROSTER)
+    broker = ToolBroker(
+        ROSTER,
+        # Keep dialing long enough that you can start the second upstream by
+        # hand and still see it appear; the 60s default is sized for upstreams
+        # that boot with the application, not for a demo you drive manually.
+        giveup_after_s=3600,
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
