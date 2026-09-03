@@ -43,6 +43,14 @@ files = ["mcp_broker"]
 disallow_untyped_defs = true
 check_untyped_defs = true
 warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# mcp / FastMCP ships partial types; the streamable-http surface this
+# package touches (ClientSession, low-level Server, session manager) is
+# untyped enough to warrant ignoring missing imports. Declared per-module
+# rather than a blanket ignore_missing_imports so a first-party import that
+# stops resolving still fails the gate.
+module = ["mcp.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
