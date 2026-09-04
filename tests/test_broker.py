@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
+import socket
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -25,7 +27,7 @@ import mcp.types as types
 import pytest
 
 from mcp_broker.broker import ToolBroker
-from mcp_broker.upstream import _UNREACHABLE_WARN_AFTER, Upstream
+from mcp_broker.upstream import _UNREACHABLE_WARN_AFTER, Upstream, classify_probe_result
 
 _OFFICE = "workspace-tool-office"
 _URL = "http://localhost:8090/mcp"
@@ -267,6 +269,7 @@ class RecordingMetrics:
         self.ready: dict[str, float] = {}
         self.exits: dict[tuple[str, str], float] = {}
         self.giveups: dict[str, float] = {}
+        self.probes: dict[tuple[str, str], float] = {}
 
     def set_upstream_ready(self, name: str, ready: bool) -> None:
         self.ready[name] = 1.0 if ready else 0.0
@@ -276,6 +279,9 @@ class RecordingMetrics:
 
     def inc_upstream_giveup(self, name: str) -> None:
         self.giveups[name] = self.giveups.get(name, 0.0) + 1.0
+
+    def inc_child_probe(self, name: str, result: str) -> None:
+        self.probes[(name, result)] = self.probes.get((name, result), 0.0) + 1.0
 
 
 # One recorder per module run; each test uses its own upstream name, matching how
@@ -476,3 +482,64 @@ def _capture(logger_name: str):
 
 def _giveup_count(server: str) -> float:
     return METRICS.giveups.get(server, 0.0)
+
+
+# --- classified cross-pod probe result (incident 2026-09-04) -----------------
+#
+# The broker used to fold every probe failure into a bare ready=False, so a
+# cutover child that was NEVER reachable (loopback bind / no Service route) read
+# the same as one still booting. classify_probe_result + inc_child_probe on every
+# probe give the distinguishing axis.
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (None, "reachable"),
+        (TimeoutError("slow"), "timeout"),
+        (ConnectionRefusedError(errno.ECONNREFUSED, "refused"), "conn_refused"),
+        (OSError(errno.ECONNREFUSED, "Connection refused"), "conn_refused"),
+        (socket.gaierror(-2, "Name or service not known"), "dns_fail"),
+        (RuntimeError("Server returned status 503"), "http_error"),
+        # httpx-shaped: no OSError in the chain, classify by message text.
+        (RuntimeError("connect operation timed out"), "timeout"),
+        (RuntimeError("[Errno 111] Connection refused"), "conn_refused"),
+    ],
+)
+def test_classify_probe_result(exc: BaseException | None, expected: str) -> None:
+    assert classify_probe_result(exc) == expected
+
+
+def test_classify_probe_result_walks_the_cause_chain() -> None:
+    # httpx wraps the OSError, so the top exception is a generic transport error
+    # and the errno lives on __cause__ — the classifier must find it.
+    root = ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+    wrapped = RuntimeError("All connection attempts failed")
+    wrapped.__cause__ = root
+    assert classify_probe_result(wrapped) == "conn_refused"
+
+
+async def test_probe_reports_reachable_result_on_success() -> None:
+    m = RecordingMetrics()
+    up = Upstream("workspace-tool-telegram", _URL, dialer=_FakeDialer(), metrics=m)
+    await up.probe()
+    assert m.probes.get(("workspace-tool-telegram", "reachable")) == 1.0
+
+
+async def test_probe_reports_conn_refused_on_a_refusing_child() -> None:
+    # A child that binds loopback in another pod: the pod answers but nothing is
+    # listening on the child port -> ECONNREFUSED, the bind-gap fingerprint.
+    class _RefusingDialer(_FakeDialer):
+        @contextlib.asynccontextmanager
+        async def __call__(self, url: str, *, headers: dict[str, str] | None = None):  # type: ignore[override]
+            self.dials += 1
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+            yield  # pragma: no cover
+
+    m = RecordingMetrics()
+    up = Upstream("workspace-tool-telegram", _URL, dialer=_RefusingDialer(), metrics=m)
+    assert await up.probe() is False
+    assert m.probes.get(("workspace-tool-telegram", "conn_refused")) == 1.0
+    # Every probe reports — a never-reachable child is NOT silent on this axis.
+    assert await up.probe() is False
+    assert m.probes.get(("workspace-tool-telegram", "conn_refused")) == 2.0

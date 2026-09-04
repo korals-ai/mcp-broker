@@ -15,7 +15,9 @@ appears mid-session once the broker notifies (see the broker's dial loop).
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
+import socket
 import uuid
 from typing import Any
 from urllib.parse import quote
@@ -26,6 +28,49 @@ from mcp_broker.dialer import Dialer
 from mcp_broker.metrics import NULL_METRICS, BrokerMetrics
 
 log = logging.getLogger("workspace.tool_broker")
+
+# The complete, closed vocabulary classify_probe_result can return. Exported so a
+# consumer that turns these into metric labels can pre-seed EXACTLY this set (an
+# unseeded label is absent-until-first-increment, so a result that never happens
+# to fire reads as "no data" instead of 0). A join test pins the consumer's label
+# set to this constant, so adding a result here without seeding it fails loudly.
+PROBE_RESULTS = frozenset({"reachable", "timeout", "conn_refused", "dns_fail", "http_error"})
+
+
+def classify_probe_result(exc: BaseException | None) -> str:
+    """Map a probe outcome to the low-cardinality ``inc_child_probe`` axis:
+    ``reachable`` (exc is None) | ``timeout`` | ``conn_refused`` | ``dns_fail`` |
+    ``http_error``. Transport-library-agnostic on purpose — the broker mustn't
+    depend on httpx's exception classes — so it walks the ``__cause__`` /
+    ``__context__`` chain for an ``OSError`` errno (the ground truth httpx wraps)
+    and falls back to type-name / message heuristics. The distinction is the
+    whole point: ``conn_refused`` = the pod answered but nothing is listening (a
+    child *bind* gap), ``timeout`` = the dial blackholed (a *routing*/Service
+    gap), ``dns_fail`` = the roster host doesn't resolve; a bare bool folds all
+    three into one indistinguishable "not ready"."""
+    if exc is None:
+        return "reachable"
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, TimeoutError | asyncio.TimeoutError):
+            return "timeout"
+        if isinstance(cur, socket.gaierror):
+            return "dns_fail"
+        if isinstance(cur, OSError) and cur.errno == errno.ECONNREFUSED:
+            return "conn_refused"
+        cur = cur.__cause__ or cur.__context__
+    text = f"{type(exc).__name__}: {exc}".lower()
+    _dns = ("name or service not known", "nodename nor servname", "temporary failure in name")
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "refused" in text:
+        return "conn_refused"
+    if any(marker in text for marker in _dns):
+        return "dns_fail"
+    return "http_error"
+
 
 # After this many consecutive failed probes, a sidecar that never comes ready is
 # no longer "still booting" — escalate from DEBUG to WARNING (with the dial URL +
@@ -132,18 +177,21 @@ class Upstream:
         self._last_probe_t = asyncio.get_running_loop().time()
         try:
             tools = await asyncio.wait_for(self._probe_once(), timeout=self._probe_timeout_s)
-        except TimeoutError:
+        except TimeoutError as exc:
             self._note_probe_failure(
                 f"no answer within {self._probe_timeout_s:.0f}s (wedged or booting)"
             )
+            self._metrics.inc_child_probe(self._name, classify_probe_result(exc))
             self._set_reachable(False, reason="probe_timeout")
             return False
         except Exception as exc:  # any dial/list failure means "not up yet"
             self._note_probe_failure(f"{type(exc).__name__}: {exc}")
+            self._metrics.inc_child_probe(self._name, classify_probe_result(exc))
             self._set_reachable(False, reason="probe_unreachable")
             return False
         self._note_probe_success()
         self._tools = tools
+        self._metrics.inc_child_probe(self._name, "reachable")
         self._set_reachable(True, reason="probe_ok")
         return not was_ready
 

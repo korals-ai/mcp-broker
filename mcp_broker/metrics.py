@@ -21,7 +21,7 @@ from typing import Protocol
 
 
 class BrokerMetrics(Protocol):
-    """What the broker reports. Implement the three you care about."""
+    """What the broker reports. Implement the ones you care about."""
 
     def set_upstream_ready(self, name: str, ready: bool) -> None:
         """An upstream's reachability changed."""
@@ -31,6 +31,17 @@ class BrokerMetrics(Protocol):
 
     def inc_upstream_exit(self, name: str, reason: str) -> None:
         """A previously-live upstream went away."""
+
+    def inc_child_probe(self, name: str, result: str) -> None:
+        """The outcome of a SINGLE probe dial, reported on EVERY probe (not only
+        the ready/not-ready edge ``set_upstream_ready`` fires on). ``result`` is
+        one of ``reachable`` | ``timeout`` | ``conn_refused`` | ``dns_fail`` |
+        ``http_error`` — the axis that distinguishes a child that is booting
+        (comes ready shortly) from one that is on the network but refusing (a
+        bind gap) from one that is blackholed (a routing/Service gap). A bare
+        ready/not-ready bool cannot tell those apart, which is exactly how a
+        cross-pod child that was never reachable read the same as a
+        slow-to-start one."""
 
 
 class NullMetrics:
@@ -47,6 +58,9 @@ class NullMetrics:
         return None
 
     def inc_upstream_exit(self, name: str, reason: str) -> None:
+        return None
+
+    def inc_child_probe(self, name: str, result: str) -> None:
         return None
 
 
