@@ -349,3 +349,66 @@ async def test_notify_bounds_a_wedged_session_and_still_reaches_the_healthy_one(
     assert healthy.notified == 1  # not starved by head-of-line blocking
     assert wedged not in broker._sessions[_ODOO]  # the wedged session is pruned
     assert healthy in broker._sessions[_ODOO]  # the healthy one is retained
+
+
+# ---- session-child probes report through the metrics seam -------------------
+
+
+class _RecordingMetrics:
+    """BrokerMetrics fake that records child-probe results."""
+
+    def __init__(self) -> None:
+        self.child_probes: list[tuple[str, str]] = []
+        self.ready: list[tuple[str, float]] = []
+        self.exits: list[tuple[str, str]] = []
+
+    def set_upstream_ready(self, name: str, value: float) -> None:
+        self.ready.append((name, value))
+
+    def inc_upstream_giveup(self, name: str) -> None:  # pragma: no cover - unused
+        raise AssertionError("session upstreams have no dial loop")
+
+    def inc_upstream_exit(self, name: str, reason: str) -> None:
+        self.exits.append((name, reason))
+
+    def inc_child_probe(self, name: str, result: str) -> None:
+        self.child_probes.append((name, result))
+
+
+async def test_session_child_probes_report_through_the_metrics_seam() -> None:
+    """register_session's probes must feed the metrics seam. Session children
+    have no dial loop, so the child-probe counter is the ONLY health signal a
+    broken per-user connector emits; constructing the session Upstream without
+    the broker's metrics left it NULL_METRICS and a down child metric-dark
+    (2026-09-05 audit: broken telegram child on stg raised no series at all)."""
+    metrics = _RecordingMetrics()
+    dialer = _RecordingDialer([_tool("odoo_search")])
+    broker = ToolBroker(
+        [(_ODOO, _CONTROL_URL)],
+        dialer=dialer,
+        session_scoped={_ODOO},
+        metrics=metrics,
+    )
+    ready = await broker.register_session(_ODOO, "tok-alice", "http://127.0.0.1:8100/mcp")
+    assert ready is True
+    assert (_ODOO, "reachable") in metrics.child_probes
+
+
+async def test_session_child_failed_probe_reports_through_the_metrics_seam() -> None:
+    """The broken half: a child that never answers must record its probe
+    failures (the alertable signal), not vanish behind NULL_METRICS."""
+    metrics = _RecordingMetrics()
+    broker = ToolBroker(
+        [(_ODOO, _CONTROL_URL)],
+        dialer=_WedgedDialer(),
+        session_scoped={_ODOO},
+        session_probe_budget_s=0.0,  # one probe attempt
+        probe_timeout_s=0.2,
+        metrics=metrics,
+    )
+    ready = await broker.register_session(_ODOO, "tok-alice", "http://127.0.0.1:8100/mcp")
+    assert ready is False
+    assert metrics.child_probes, "a failed session-child probe must reach the seam"
+    name, result = metrics.child_probes[-1]
+    assert name == _ODOO
+    assert result != "reachable"

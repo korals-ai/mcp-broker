@@ -247,12 +247,17 @@ class ToolBroker:
         ``url`` for a session-scoped connector, probe it so its tools are live,
         and notify open CLI sessions so the tools appear mid-session. Returns
         whether the child answered the probe."""
+        # metrics threaded deliberately: session children have no dial loop, so
+        # the probe counter (child_probe seam) is the ONLY health signal a
+        # broken per-user child emits — without it a down child is metric-dark
+        # (found 2026-09-05 auditing why a broken connector raised no alert).
         up = Upstream(
             name,
             url,
             dialer=self._dial,
             call_timeout_s=self._call_timeout_s,
             probe_timeout_s=self._probe_timeout_s,
+            metrics=self._metrics,
         )
         # The sidecar's control POST returns as soon as the child process is
         # SPAWNED — it may not be listening yet. A single probe loses that
