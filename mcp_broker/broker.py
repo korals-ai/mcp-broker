@@ -164,6 +164,21 @@ class ToolBroker:
         # Live CLI sessions per sidecar, captured in the list_tools handler, so
         # the dial loop can push tools/list_changed to each open connection.
         self._sessions: dict[str, set[ServerSession]] = {name: set() for name in self._upstreams}
+        # What each live CLI session is listing UNDER: (session token, chat id).
+        # The set above cannot answer that, which is why a notify can be
+        # absorbed by the wrong session and why clear_session cannot prune.
+        # Recorded here so both become measurable before either is changed.
+        self._session_ctx: dict[ServerSession, tuple[str | None, str | None]] = {}
+        # Session token -> the chat that registered it. Broker events carry no
+        # chat id of their own (only the browser tool's URL has one), so
+        # without this every tools/list line in Loki reads `chat_id=-` and
+        # cannot be tied to the conversation the user is complaining about.
+        self._token_chat: dict[str, str] = {}
+        # (name, token) registered and notified, but not yet observed serving
+        # tools to anyone. This is the HEAL, as opposed to the notify: "we told
+        # the CLI" and "the agent ended up with the tools" are different
+        # events, and only the second one is what the user experiences.
+        self._pending_heal: dict[tuple[str, str], float] = {}
         self._managers: dict[str, StreamableHTTPSessionManager] = {
             name: StreamableHTTPSessionManager(app=self._build_server(name), stateless=False)
             for name in self._upstreams
@@ -242,11 +257,19 @@ class ToolBroker:
             return None
         return self._session_upstreams.get((name, token))
 
-    async def register_session(self, name: str, token: str, url: str) -> bool:
+    async def register_session(
+        self, name: str, token: str, url: str, *, chat_id: str | None = None
+    ) -> bool:
         """Attach a session's per-user child (already spawned by the sidecar) at
         ``url`` for a session-scoped connector, probe it so its tools are live,
         and notify open CLI sessions so the tools appear mid-session. Returns
-        whether the child answered the probe."""
+        whether the child answered the probe.
+
+        ``chat_id`` is recorded for attribution only — it never routes
+        anything. Without it a broker log line cannot be tied to the chat whose
+        tools went missing, which is the first question anyone asks."""
+        if chat_id:
+            self._token_chat[token] = chat_id
         # metrics threaded deliberately: session children have no dial loop, so
         # the probe counter (child_probe seam) is the ONLY health signal a
         # broken per-user child emits — without it a down child is metric-dark
@@ -284,16 +307,37 @@ class ToolBroker:
         # so registering BEFORE the CLI's first list reaches nobody — and
         # nothing re-lists afterwards. Report it rather than leaving the two
         # cases indistinguishable in the log.
-        notified = await self._notify(name)
-        self._metrics.inc_session_notify(name, "delivered" if notified else "no_sessions")
+        notified, matched = await self._notify(name, token=token)
+        # Three outcomes, not two. "delivered" hid the case that actually
+        # bites: the notify reached CLI sessions, but none of them was the one
+        # holding THIS token — so the session that needs the tools was never
+        # told, while the counter said delivered.
+        if not notified:
+            outcome = "no_sessions"
+        elif matched:
+            outcome = "delivered"
+        else:
+            outcome = "delivered_foreign_only"
+        self._metrics.inc_session_notify(name, outcome)
+        # Arm the heal watch: cleared when a list for this exact (name, token)
+        # actually serves tools. Anything still armed is a session that was
+        # told and never came back.
+        self._pending_heal[(name, token)] = asyncio.get_running_loop().time()
+        self._metrics.set_pending_heals(name, self._pending_heal_count(name))
         log.info(
-            "registered session upstream name=%s url=%s ready=%s notified_sessions=%d",
+            "registered session upstream name=%s chat=%s url=%s ready=%s "
+            "notified_sessions=%d notified_this_token=%d",
             name,
+            self._token_chat.get(token, "-"),
             url,
             up.ready,
             notified,
+            matched,
         )
         return up.ready
+
+    def _pending_heal_count(self, name: str) -> int:
+        return sum(1 for key in self._pending_heal if key[0] == name)
 
     def clear_session(self, token: str) -> None:
         """Drop every per-session upstream for ``token`` (session ended).
@@ -309,6 +353,21 @@ class ToolBroker:
         for key in [k for k in self._session_upstreams if k[1] == token]:
             self._metrics.inc_session_cleared(key[0])
             del self._session_upstreams[key]
+        # A session ending with its heal still armed is the verdict: it was
+        # told the tools existed and never saw them for its whole life. Counted
+        # HERE because this is the last moment the fact is knowable — after
+        # this the evidence is gone.
+        for key in [k for k in self._pending_heal if k[1] == token]:
+            self._metrics.inc_heal(key[0], "never_served")
+            log.warning(
+                "session ended with tools never served name=%s chat=%s — the agent "
+                "was notified the connector attached and never listed it successfully",
+                key[0],
+                self._token_chat.get(token, "-"),
+            )
+            del self._pending_heal[key]
+            self._metrics.set_pending_heals(key[0], self._pending_heal_count(key[0]))
+        self._token_chat.pop(token, None)
 
     async def _list_tools_for(self, name: str) -> list[types.Tool]:
         """The ``tools/list`` body for one sidecar: the routed upstream's
@@ -319,21 +378,28 @@ class ToolBroker:
         and rate-limited so a permanently wedged child (crashed transport,
         e.g. unreachable Odoo host) costs at most one probe timeout per
         window instead of one per list."""
+        token = _CURRENT_TOKEN.get()
         up = self._upstream_for(name)
         if up is None:
-            # Session-scoped with nothing registered for this request's token.
-            # Either the connector is not connected for this user, or the token
-            # did not propagate — and the CLI just learns "no tools", which the
-            # agent reports to the user as "not connected". Nothing else in the
-            # system records this, which is how it stayed invisible.
-            self._metrics.inc_tools_list(name, "empty_no_upstream")
+            # Two very different failures used to share one label, and they need
+            # opposite fixes:
+            #   no_token      - this CLI's MCP URL never carried a session
+            #                   token. It cannot be healed by waiting: the URL
+            #                   was fixed when the agent spawned, so no later
+            #                   attach can ever route to it. A BUG.
+            #   unregistered  - the token is fine, the child just is not
+            #                   attached yet. Ordinary startup, heals on the
+            #                   listChanged re-list. A RACE.
+            outcome = "empty_unregistered" if token else "empty_no_token"
+            self._metrics.inc_tools_list(name, outcome)
             self._metrics.set_tools_advertised(name, 0)
             log.warning(
-                "broker tools/list %s -> EMPTY: no upstream for this session "
-                "(session_scoped=%s, token_present=%s) — the agent will report it as not connected",
+                "broker tools/list %s -> EMPTY (%s) chat=%s session_scoped=%s "
+                "— the agent will report it as not connected",
                 name,
+                outcome,
+                self._token_chat.get(token or "", "-"),
                 name in self._session_scoped,
-                _CURRENT_TOKEN.get() is not None,
             )
             return []
         if (
@@ -354,14 +420,37 @@ class ToolBroker:
             outcome = "empty_not_ready"
         self._metrics.inc_tools_list(name, outcome)
         self._metrics.set_tools_advertised(name, len(tools))
+        if tools and token is not None:
+            self._settle_heal(name, token)
         if not tools:
             log.warning(
-                "broker tools/list %s -> EMPTY (%s, ready=%s) — the agent cannot see this server's tools",
+                "broker tools/list %s -> EMPTY (%s, ready=%s) chat=%s "
+                "— the agent cannot see this server's tools",
                 name,
                 outcome,
                 up.ready,
+                self._token_chat.get(token or "", "-"),
             )
         return tools
+
+    def _settle_heal(self, name: str, token: str) -> None:
+        """Record that the tools actually REACHED the agent for this session.
+
+        The notify counter says we told the CLI; this says the CLI came back
+        and got a non-empty roster. Only the second one is the thing the user
+        experiences, and the two can disagree.
+        """
+        started = self._pending_heal.pop((name, token), None)
+        if started is None:
+            return
+        self._metrics.inc_heal(name, "served")
+        self._metrics.set_pending_heals(name, self._pending_heal_count(name))
+        log.info(
+            "tools reached the agent name=%s chat=%s after_ms=%d",
+            name,
+            self._token_chat.get(token, "-"),
+            int((asyncio.get_running_loop().time() - started) * 1000),
+        )
 
     def _build_server(self, name: str) -> Server[Any, Any]:
         server: Server[Any, Any] = _ListChangedServer(f"broker-{name}")
@@ -371,7 +460,16 @@ class ToolBroker:
             # request_context is only valid inside a handler — this is the one
             # safe point to capture the live session for later notification.
             with contextlib.suppress(LookupError):
-                self._sessions[name].add(server.request_context.session)
+                session = server.request_context.session
+                self._sessions[name].add(session)
+                token = _CURRENT_TOKEN.get()
+                self._session_ctx[session] = (token, self._token_chat.get(token or ""))
+                if name in self._session_scoped and token is None:
+                    # A CLI session on a per-user connector with no token can
+                    # never be routed, no matter what attaches later. Counting
+                    # it separates "not connected yet" from "unreachable for
+                    # the life of this session".
+                    self._metrics.inc_tools_list(name, "cli_session_tokenless")
             # The denominator for a "no_sessions" notify: without it, "nobody
             # was listening" and "everybody was unreachable" look the same.
             self._metrics.set_cli_sessions(name, len(self._sessions[name]))
@@ -466,9 +564,13 @@ class ToolBroker:
             await asyncio.sleep(delay)
             delay = min(delay * 2, self._poll_max_s)
 
-    async def _notify(self, name: str) -> int:
+    async def _notify(self, name: str, *, token: str | None = None) -> tuple[int, int]:
         """Push ``tools/list_changed`` to every open CLI session for ``name``,
-        returning how many were successfully told.
+        returning (successfully told, of which were listening under ``token``).
+
+        The second number is the one that matters. A notify can land on several
+        CLI sessions and still miss the only one that needed it — the counters
+        said "delivered" while the agent that was waiting heard nothing.
         pruning any that have since closed OR gone unresponsive.
 
         Each send is bounded: a CLI session whose transport is wedged (a
@@ -479,14 +581,19 @@ class ToolBroker:
         it re-registers on its next tools/list."""
         dead: set[ServerSession] = set()
         delivered = 0
+        matched = 0
         for session in list(self._sessions[name]):
             try:
                 await asyncio.wait_for(
                     session.send_tool_list_changed(), timeout=self._notify_timeout_s
                 )
                 delivered += 1
+                if token is not None and self._session_ctx.get(session, (None, None))[0] == token:
+                    matched += 1
             except Exception as exc:  # closed OR wedged -> prune; re-adds on next list
                 log.debug("broker notify dropping dead/wedged session for %s: %s", name, exc)
                 dead.add(session)
         self._sessions[name] -= dead
-        return delivered
+        for session in dead:
+            self._session_ctx.pop(session, None)
+        return delivered, matched

@@ -26,7 +26,7 @@ from typing import Any
 import mcp.types as types
 import pytest
 
-from mcp_broker.broker import ToolBroker
+from mcp_broker.broker import _CURRENT_TOKEN, ToolBroker
 from mcp_broker.upstream import _UNREACHABLE_WARN_AFTER, Upstream, classify_probe_result
 
 _OFFICE = "workspace-tool-office"
@@ -281,6 +281,8 @@ class RecordingMetrics:
         self.replaced: dict[str, float] = {}
         self.cleared: dict[str, float] = {}
         self.cli_sessions: dict[str, int] = {}
+        self.heals: dict[tuple[str, str], float] = {}
+        self.pending_heals: dict[str, int] = {}
 
     def set_upstream_ready(self, name: str, ready: bool) -> None:
         self.ready[name] = 1.0 if ready else 0.0
@@ -316,6 +318,13 @@ class RecordingMetrics:
 
     def set_cli_sessions(self, name: str, count: int) -> None:
         self.cli_sessions[name] = count
+
+    def inc_heal(self, name: str, outcome: str) -> None:
+        key = (name, outcome)
+        self.heals[key] = self.heals.get(key, 0.0) + 1.0
+
+    def set_pending_heals(self, name: str, count: int) -> None:
+        self.pending_heals[name] = count
 
 
 # One recorder per module run; each test uses its own upstream name, matching how
@@ -611,8 +620,12 @@ async def test_register_session_reports_delivered_when_a_cli_is_listening() -> N
     broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), metrics=METRICS)
     session = _FakeSession()
     broker._sessions[name].add(session)  # type: ignore[arg-type]
+    # The CLI records what it is listening under on its first tools/list; a
+    # session with no recorded token is a DIFFERENT outcome (below), so the
+    # positive control has to look like a real listener.
+    broker._session_ctx[session] = ("tok-2", "chat-live")  # type: ignore[index]
 
-    await broker.register_session(name, "tok-2", _URL)
+    await broker.register_session(name, "tok-2", _URL, chat_id="chat-live")
 
     assert _session_notify(name, "delivered") == before + 1
     assert session.notified == 1
@@ -640,14 +653,16 @@ async def test_tools_list_reports_empty_when_no_upstream_is_registered() -> None
     was told NONE. Previously this produced no record at all, which is why a
     connected-but-unroutable connector was invisible for a whole day."""
     name = "listsig-no-upstream"
-    before = _tools_list(name, "empty_no_upstream")
+    before = _tools_list(name, "empty_no_token")
     broker = ToolBroker(
         [(name, _URL)], dialer=_FakeDialer(), session_scoped={name}, metrics=METRICS
     )
 
     assert await broker._list_tools_for(name) == []
 
-    assert _tools_list(name, "empty_no_upstream") == before + 1
+    # No token in context, so this is the unhealable half of the split: the
+    # CLI's MCP URL never carried one and no later attach can change that.
+    assert _tools_list(name, "empty_no_token") == before + 1
     assert METRICS.tools_advertised[name] == 0
 
 
@@ -738,3 +753,85 @@ async def test_clear_session_does_not_prune_cli_sessions() -> None:
     broker.clear_session("tok-x")
 
     assert len(broker._sessions[name]) == 1, "behaviour changed — update the docstring above"
+
+
+async def test_a_notify_that_reaches_only_OTHER_sessions_is_not_delivered() -> None:
+    """The failure the old counter could not express, seen live on stg
+    2026-09-06: the notify landed on two CLI sessions and neither was the one
+    holding this token. "delivered" was true and the agent that was waiting
+    heard nothing, so the tools stayed invisible while the metric looked
+    healthy. A foreign delivery must not read as a delivery."""
+    name = "sess-notify-foreign"
+    before = _session_notify(name, "delivered_foreign_only")
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), metrics=METRICS)
+    stranger = _FakeSession()
+    broker._sessions[name].add(stranger)  # type: ignore[arg-type]
+    broker._session_ctx[stranger] = ("someone-elses-token", "other-chat")  # type: ignore[index]
+
+    await broker.register_session(name, "tok-mine", _URL)
+
+    assert _session_notify(name, "delivered_foreign_only") == before + 1
+    assert _session_notify(name, "delivered") == 0.0
+    assert stranger.notified == 1  # it WAS told; it just was not the one waiting
+
+
+def _heal(server: str, outcome: str) -> float:
+    return METRICS.heals.get((server, outcome), 0.0)
+
+
+async def test_the_heal_is_recorded_when_tools_actually_reach_the_agent() -> None:
+    """The notify is a message we send; the heal is the outcome the user gets.
+    Only a later list that actually SERVES tools proves the second."""
+    name = "heal-served"
+    broker = ToolBroker(
+        [(name, _URL)], dialer=_FakeDialer(), session_scoped={name}, metrics=METRICS
+    )
+    token = _CURRENT_TOKEN.set("tok-heal")
+    try:
+        await broker.register_session(name, "tok-heal", _URL, chat_id="chat-heal")
+        assert METRICS.pending_heals[name] == 1
+
+        assert await broker._list_tools_for(name)
+    finally:
+        _CURRENT_TOKEN.reset(token)
+
+    assert _heal(name, "served") == 1.0
+    assert METRICS.pending_heals[name] == 0
+
+
+async def test_a_session_that_ends_still_waiting_is_recorded_as_never_served() -> None:
+    """The verdict has to be taken at teardown: after the session is gone there
+    is no longer any way to know it never saw the tools it was promised."""
+    name = "heal-never"
+    broker = ToolBroker(
+        [(name, _URL)], dialer=_FakeDialer(), session_scoped={name}, metrics=METRICS
+    )
+    await broker.register_session(name, "tok-never", _URL, chat_id="chat-never")
+
+    broker.clear_session("tok-never")
+
+    assert _heal(name, "never_served") == 1.0
+    assert METRICS.pending_heals[name] == 0
+
+
+async def test_an_empty_list_separates_a_missing_token_from_an_unattached_child() -> None:
+    """These look identical to the agent and need opposite fixes. A missing
+    token can NEVER heal — the CLI's MCP URL was fixed when the agent spawned —
+    while an unattached child heals on the next list. Sharing one label is what
+    made a bug and ordinary startup indistinguishable for a day."""
+    name = "empty-split"
+    broker = ToolBroker(
+        [(name, _URL)], dialer=_FakeDialer(), session_scoped={name}, metrics=METRICS
+    )
+
+    assert await broker._list_tools_for(name) == []
+    no_token = _tools_list(name, "empty_no_token")
+
+    reset = _CURRENT_TOKEN.set("tok-present-but-unattached")
+    try:
+        assert await broker._list_tools_for(name) == []
+    finally:
+        _CURRENT_TOKEN.reset(reset)
+
+    assert no_token == 1.0
+    assert _tools_list(name, "empty_unregistered") == 1.0

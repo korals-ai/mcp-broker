@@ -364,6 +364,8 @@ class _RecordingMetrics:
         self.session_notifies: list[tuple[str, str]] = []
         self.tools_lists: list[tuple[str, str]] = []
         self.cli_sessions: dict[str, int] = {}
+        self.heals: list[tuple[str, str]] = []
+        self.pending_heals: dict[str, int] = {}
 
     def set_upstream_ready(self, name: str, value: float) -> None:
         self.ready.append((name, value))
@@ -397,6 +399,12 @@ class _RecordingMetrics:
 
     def set_cli_sessions(self, name: str, count: int) -> None:
         self.cli_sessions[name] = count
+
+    def inc_heal(self, name: str, outcome: str) -> None:
+        self.heals.append((name, outcome))
+
+    def set_pending_heals(self, name: str, count: int) -> None:
+        self.pending_heals[name] = count
 
 
 async def test_session_child_probes_report_through_the_metrics_seam() -> None:

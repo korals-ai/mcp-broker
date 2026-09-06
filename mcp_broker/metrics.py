@@ -98,6 +98,20 @@ class BrokerMetrics(Protocol):
         ``name`` — the denominator that makes a ``no_sessions`` notify
         interpretable (nobody listening vs. everybody unreachable)."""
 
+    def inc_heal(self, name: str, outcome: str) -> None:
+        """Did the tools actually REACH the agent after a connector attached?
+
+        ``served`` — a later tools/list for that same session returned a
+        non-empty roster. ``never_served`` — the session ended still waiting.
+        This is deliberately NOT the notify counter: "we told the CLI" and "the
+        agent ended up with the tools" are different events, they can disagree,
+        and only the second is what the user experiences."""
+
+    def set_pending_heals(self, name: str, count: int) -> None:
+        """Sessions told a connector attached and not yet observed receiving
+        its tools. A number that does not return to zero is the shape of a
+        connector that is connected and invisible."""
+
 
 class NullMetrics:
     """The default: report nothing.
@@ -137,6 +151,12 @@ class NullMetrics:
         return None
 
     def set_cli_sessions(self, name: str, count: int) -> None:
+        return None
+
+    def inc_heal(self, name: str, outcome: str) -> None:
+        return None
+
+    def set_pending_heals(self, name: str, count: int) -> None:
         return None
 
 
