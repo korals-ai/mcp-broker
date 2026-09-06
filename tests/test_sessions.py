@@ -361,6 +361,9 @@ class _RecordingMetrics:
         self.child_probes: list[tuple[str, str]] = []
         self.ready: list[tuple[str, float]] = []
         self.exits: list[tuple[str, str]] = []
+        self.session_notifies: list[tuple[str, str]] = []
+        self.tools_lists: list[tuple[str, str]] = []
+        self.cli_sessions: dict[str, int] = {}
 
     def set_upstream_ready(self, name: str, value: float) -> None:
         self.ready.append((name, value))
@@ -373,6 +376,27 @@ class _RecordingMetrics:
 
     def inc_child_probe(self, name: str, result: str) -> None:
         self.child_probes.append((name, result))
+
+    def inc_session_notify(self, name: str, outcome: str) -> None:
+        self.session_notifies.append((name, outcome))
+
+    def inc_tools_list(self, name: str, outcome: str) -> None:
+        self.tools_lists.append((name, outcome))
+
+    def set_tools_advertised(self, name: str, count: int) -> None:
+        return None
+
+    def inc_call_no_upstream(self, name: str) -> None:
+        return None
+
+    def inc_session_upstream_replaced(self, name: str) -> None:
+        return None
+
+    def inc_session_cleared(self, name: str) -> None:
+        return None
+
+    def set_cli_sessions(self, name: str, count: int) -> None:
+        self.cli_sessions[name] = count
 
 
 async def test_session_child_probes_report_through_the_metrics_seam() -> None:

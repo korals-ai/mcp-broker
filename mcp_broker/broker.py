@@ -270,14 +270,44 @@ class ToolBroker:
         while not up.ready and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.25)
             await up.probe()
+        if (name, token) in self._session_upstreams:
+            # Overwriting a live upstream: the old one is dropped without being
+            # closed. Harmless once, a churn signal in bulk — and previously
+            # indistinguishable from a first registration.
+            self._metrics.inc_session_upstream_replaced(name)
+            log.info("replacing existing session upstream name=%s (re-attach)", name)
         self._session_upstreams[(name, token)] = up
-        await self._notify(name)
-        log.info("registered session upstream name=%s url=%s ready=%s", name, url, up.ready)
+        # How many CLI sessions this notify actually reached is the difference
+        # between "the tools will appear" and "the tools are invisible for the
+        # life of this session". _sessions[name] is only populated when a CLI
+        # has already issued a tools/list for this server (see _build_server),
+        # so registering BEFORE the CLI's first list reaches nobody — and
+        # nothing re-lists afterwards. Report it rather than leaving the two
+        # cases indistinguishable in the log.
+        notified = await self._notify(name)
+        self._metrics.inc_session_notify(name, "delivered" if notified else "no_sessions")
+        log.info(
+            "registered session upstream name=%s url=%s ready=%s notified_sessions=%d",
+            name,
+            url,
+            up.ready,
+            notified,
+        )
         return up.ready
 
     def clear_session(self, token: str) -> None:
-        """Drop every per-session upstream for ``token`` (session ended)."""
+        """Drop every per-session upstream for ``token`` (session ended).
+
+        Does NOT touch ``_sessions``: those are CLI ServerSession objects keyed
+        by server name, not by token, so this method cannot tell which of them
+        belonged to the ending session. They are pruned lazily instead — a dead
+        session fails its next notify and is removed there. That laziness is
+        worth knowing about, because until the next notify each stale entry
+        costs one notify timeout on the attach path, so the count is published
+        (set_cli_sessions) rather than left to be guessed at.
+        """
         for key in [k for k in self._session_upstreams if k[1] == token]:
+            self._metrics.inc_session_cleared(key[0])
             del self._session_upstreams[key]
 
     async def _list_tools_for(self, name: str) -> list[types.Tool]:
@@ -291,6 +321,20 @@ class ToolBroker:
         window instead of one per list."""
         up = self._upstream_for(name)
         if up is None:
+            # Session-scoped with nothing registered for this request's token.
+            # Either the connector is not connected for this user, or the token
+            # did not propagate — and the CLI just learns "no tools", which the
+            # agent reports to the user as "not connected". Nothing else in the
+            # system records this, which is how it stayed invisible.
+            self._metrics.inc_tools_list(name, "empty_no_upstream")
+            self._metrics.set_tools_advertised(name, 0)
+            log.warning(
+                "broker tools/list %s -> EMPTY: no upstream for this session "
+                "(session_scoped=%s, token_present=%s) — the agent will report it as not connected",
+                name,
+                name in self._session_scoped,
+                _CURRENT_TOKEN.get() is not None,
+            )
             return []
         if (
             not up.ready
@@ -298,7 +342,26 @@ class ToolBroker:
             and not up.probed_recently(self._probe_timeout_s * 2)
         ):
             await up.probe()
-        return up.tools()
+        tools = up.tools()
+        if tools:
+            outcome = "served"
+        elif up.ready:
+            # Ready and advertising nothing: a misconfigured child, not a
+            # missing one. The two look identical to the agent and need
+            # opposite fixes, so they must not share an outcome.
+            outcome = "empty_ready"
+        else:
+            outcome = "empty_not_ready"
+        self._metrics.inc_tools_list(name, outcome)
+        self._metrics.set_tools_advertised(name, len(tools))
+        if not tools:
+            log.warning(
+                "broker tools/list %s -> EMPTY (%s, ready=%s) — the agent cannot see this server's tools",
+                name,
+                outcome,
+                up.ready,
+            )
+        return tools
 
     def _build_server(self, name: str) -> Server[Any, Any]:
         server: Server[Any, Any] = _ListChangedServer(f"broker-{name}")
@@ -309,12 +372,23 @@ class ToolBroker:
             # safe point to capture the live session for later notification.
             with contextlib.suppress(LookupError):
                 self._sessions[name].add(server.request_context.session)
+            # The denominator for a "no_sessions" notify: without it, "nobody
+            # was listening" and "everybody was unreachable" look the same.
+            self._metrics.set_cli_sessions(name, len(self._sessions[name]))
             return await self._list_tools_for(name)
 
         @server.call_tool(validate_input=False)
         async def _call_tool(tool_name: str, arguments: dict[str, Any]) -> types.CallToolResult:
             up = self._upstream_for(name)
             if up is None:
+                self._metrics.inc_call_no_upstream(name)
+                log.warning(
+                    "broker call %s.%s -> NO UPSTREAM for this session; returning "
+                    "'not connected' to the agent (token_present=%s)",
+                    name,
+                    tool_name,
+                    _CURRENT_TOKEN.get() is not None,
+                )
                 return types.CallToolResult(
                     content=[
                         types.TextContent(
@@ -392,8 +466,9 @@ class ToolBroker:
             await asyncio.sleep(delay)
             delay = min(delay * 2, self._poll_max_s)
 
-    async def _notify(self, name: str) -> None:
+    async def _notify(self, name: str) -> int:
         """Push ``tools/list_changed`` to every open CLI session for ``name``,
+        returning how many were successfully told.
         pruning any that have since closed OR gone unresponsive.
 
         Each send is bounded: a CLI session whose transport is wedged (a
@@ -403,12 +478,15 @@ class ToolBroker:
         the dial-heal loop. A timed-out session is pruned like a dead one;
         it re-registers on its next tools/list."""
         dead: set[ServerSession] = set()
+        delivered = 0
         for session in list(self._sessions[name]):
             try:
                 await asyncio.wait_for(
                     session.send_tool_list_changed(), timeout=self._notify_timeout_s
                 )
+                delivered += 1
             except Exception as exc:  # closed OR wedged -> prune; re-adds on next list
                 log.debug("broker notify dropping dead/wedged session for %s: %s", name, exc)
                 dead.add(session)
         self._sessions[name] -= dead
+        return delivered

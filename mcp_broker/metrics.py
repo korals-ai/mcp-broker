@@ -43,6 +43,61 @@ class BrokerMetrics(Protocol):
         cross-pod child that was never reachable read the same as a
         slow-to-start one."""
 
+    def inc_session_notify(self, name: str, outcome: str) -> None:
+        """A ``tools/list_changed`` fan-out for a session-scoped upstream that
+        arrived AFTER the CLI had already connected.
+
+        ``outcome`` is ``delivered`` (at least one live CLI session was told,
+        so the tools can appear mid-session) or ``no_sessions`` (the notify
+        reached NOBODY). ``no_sessions`` is the silent-failure case and the
+        whole reason this seam exists: the upstream is registered and healthy,
+        every log line reads success, and the agent still never sees the tools
+        because nothing will make it re-list. A bare "registered ready=True"
+        log cannot distinguish the two."""
+
+    def inc_tools_list(self, name: str, outcome: str) -> None:
+        """A ``tools/list`` was answered for ``name``.
+
+        ``outcome`` is the WHOLE point: an empty answer is the failure mode that
+        matters (the agent sees a server with no tools and concludes the system
+        is not connected), and there are four distinct reasons for it that were
+        previously indistinguishable —
+
+        * ``served``            — a non-empty roster went to the CLI.
+        * ``empty_no_upstream`` — session-scoped and nothing is registered for
+          this request's token: either the connector is not connected for this
+          user, or the token did not propagate. Nothing else reports this.
+        * ``empty_not_ready``   — an upstream exists but has never answered a
+          probe, so its tools are unknown.
+        * ``empty_ready``       — the upstream IS ready and genuinely advertises
+          zero tools. A child in this state is misconfigured, not absent, and
+          the two demand opposite fixes.
+        """
+
+    def set_tools_advertised(self, name: str, count: int) -> None:
+        """How many tools the CLI was just told ``name`` has. A drop to zero on
+        a server that previously served tools is a regression the ready gauge
+        cannot show — ``ready`` is about reachability, this is about content."""
+
+    def inc_call_no_upstream(self, name: str) -> None:
+        """A tool CALL arrived for a server with no upstream for this session.
+        The caller gets a polite "isn't connected yet" result, which reads to
+        the user like the assistant being unable rather than the platform
+        failing to route — so it must be counted or it is invisible."""
+
+    def inc_session_upstream_replaced(self, name: str) -> None:
+        """A session upstream was re-registered over a live one for the same
+        (server, token). The previous upstream is dropped without being closed;
+        a rising count means connector re-attaches are churning."""
+
+    def inc_session_cleared(self, name: str) -> None:
+        """A session upstream was dropped because its session ended."""
+
+    def set_cli_sessions(self, name: str, count: int) -> None:
+        """How many CLI sessions the broker currently believes are attached to
+        ``name`` — the denominator that makes a ``no_sessions`` notify
+        interpretable (nobody listening vs. everybody unreachable)."""
+
 
 class NullMetrics:
     """The default: report nothing.
@@ -61,6 +116,27 @@ class NullMetrics:
         return None
 
     def inc_child_probe(self, name: str, result: str) -> None:
+        return None
+
+    def inc_session_notify(self, name: str, outcome: str) -> None:
+        return None
+
+    def inc_tools_list(self, name: str, outcome: str) -> None:
+        return None
+
+    def set_tools_advertised(self, name: str, count: int) -> None:
+        return None
+
+    def inc_call_no_upstream(self, name: str) -> None:
+        return None
+
+    def inc_session_upstream_replaced(self, name: str) -> None:
+        return None
+
+    def inc_session_cleared(self, name: str) -> None:
+        return None
+
+    def set_cli_sessions(self, name: str, count: int) -> None:
         return None
 
 

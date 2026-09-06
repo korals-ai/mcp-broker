@@ -59,7 +59,11 @@ class _FakeDialer:
     """
 
     def __init__(self, tools: list[types.Tool] | None = None, *, fail_first: int = 0) -> None:
-        self.tools = tools or [_tool("convert")]
+        # `tools or [default]` cannot express "this upstream advertises NOTHING"
+        # — an empty list is falsy and silently becomes the default. That state
+        # is exactly what the empty_ready outcome exists to detect, so the
+        # fixture has to be able to produce it.
+        self.tools = [_tool("convert")] if tools is None else tools
         self.fail_first = fail_first
         self.dials = 0
         self.list_calls = 0
@@ -270,6 +274,13 @@ class RecordingMetrics:
         self.exits: dict[tuple[str, str], float] = {}
         self.giveups: dict[str, float] = {}
         self.probes: dict[tuple[str, str], float] = {}
+        self.session_notifies: dict[tuple[str, str], float] = {}
+        self.tools_lists: dict[tuple[str, str], float] = {}
+        self.tools_advertised: dict[str, int] = {}
+        self.call_no_upstream: dict[str, float] = {}
+        self.replaced: dict[str, float] = {}
+        self.cleared: dict[str, float] = {}
+        self.cli_sessions: dict[str, int] = {}
 
     def set_upstream_ready(self, name: str, ready: bool) -> None:
         self.ready[name] = 1.0 if ready else 0.0
@@ -282,6 +293,29 @@ class RecordingMetrics:
 
     def inc_child_probe(self, name: str, result: str) -> None:
         self.probes[(name, result)] = self.probes.get((name, result), 0.0) + 1.0
+
+    def inc_session_notify(self, name: str, outcome: str) -> None:
+        key = (name, outcome)
+        self.session_notifies[key] = self.session_notifies.get(key, 0.0) + 1.0
+
+    def inc_tools_list(self, name: str, outcome: str) -> None:
+        key = (name, outcome)
+        self.tools_lists[key] = self.tools_lists.get(key, 0.0) + 1.0
+
+    def set_tools_advertised(self, name: str, count: int) -> None:
+        self.tools_advertised[name] = count
+
+    def inc_call_no_upstream(self, name: str) -> None:
+        self.call_no_upstream[name] = self.call_no_upstream.get(name, 0.0) + 1.0
+
+    def inc_session_upstream_replaced(self, name: str) -> None:
+        self.replaced[name] = self.replaced.get(name, 0.0) + 1.0
+
+    def inc_session_cleared(self, name: str) -> None:
+        self.cleared[name] = self.cleared.get(name, 0.0) + 1.0
+
+    def set_cli_sessions(self, name: str, count: int) -> None:
+        self.cli_sessions[name] = count
 
 
 # One recorder per module run; each test uses its own upstream name, matching how
@@ -543,3 +577,164 @@ async def test_probe_reports_conn_refused_on_a_refusing_child() -> None:
     # Every probe reports — a never-reachable child is NOT silent on this axis.
     assert await up.probe() is False
     assert m.probes.get(("workspace-tool-telegram", "conn_refused")) == 2.0
+
+
+def _session_notify(server: str, outcome: str) -> float:
+    return METRICS.session_notifies.get((server, outcome), 0.0)
+
+
+async def test_register_session_reports_no_sessions_when_nobody_is_listening() -> None:
+    """THE instrument for the invisible-connector race.
+
+    A per-user child registered BEFORE the CLI has ever issued a tools/list for
+    that server reaches nobody: _sessions is populated only from inside the
+    list handler. The upstream is healthy, the log says ready=True, and the
+    tools are invisible for the life of the session. Without this counter the
+    two outcomes are indistinguishable.
+    """
+    name = "sess-notify-nobody"
+    before = _session_notify(name, "no_sessions")
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), metrics=METRICS)
+
+    await broker.register_session(name, "tok-1", _URL)
+
+    assert _session_notify(name, "no_sessions") == before + 1
+    assert _session_notify(name, "delivered") == 0.0
+
+
+async def test_register_session_reports_delivered_when_a_cli_is_listening() -> None:
+    """The positive control: with a live CLI session the notify lands, the
+    tools appear mid-session, and the counter says so. Without this half, a
+    permanently-zero 'delivered' would look like healthy silence."""
+    name = "sess-notify-live"
+    before = _session_notify(name, "delivered")
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), metrics=METRICS)
+    session = _FakeSession()
+    broker._sessions[name].add(session)  # type: ignore[arg-type]
+
+    await broker.register_session(name, "tok-2", _URL)
+
+    assert _session_notify(name, "delivered") == before + 1
+    assert session.notified == 1
+
+
+async def test_a_wedged_cli_session_counts_as_nobody_reached() -> None:
+    """A session that cannot be told is not a session that was told — pruning
+    it must not be recorded as a successful delivery."""
+    name = "sess-notify-wedged"
+    before = _session_notify(name, "no_sessions")
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), metrics=METRICS)
+    broker._sessions[name].add(_FakeSession(fail=True))  # type: ignore[arg-type]
+
+    await broker.register_session(name, "tok-3", _URL)
+
+    assert _session_notify(name, "no_sessions") == before + 1
+
+
+def _tools_list(server: str, outcome: str) -> float:
+    return METRICS.tools_lists.get((server, outcome), 0.0)
+
+
+async def test_tools_list_reports_empty_when_no_upstream_is_registered() -> None:
+    """The single most important signal: the agent asked what tools exist and
+    was told NONE. Previously this produced no record at all, which is why a
+    connected-but-unroutable connector was invisible for a whole day."""
+    name = "listsig-no-upstream"
+    before = _tools_list(name, "empty_no_upstream")
+    broker = ToolBroker(
+        [(name, _URL)], dialer=_FakeDialer(), session_scoped={name}, metrics=METRICS
+    )
+
+    assert await broker._list_tools_for(name) == []
+
+    assert _tools_list(name, "empty_no_upstream") == before + 1
+    assert METRICS.tools_advertised[name] == 0
+
+
+async def test_tools_list_distinguishes_ready_but_empty_from_absent() -> None:
+    """A child that is READY and advertises nothing is misconfigured; one that
+    is absent is unrouted. They look identical to the agent and need opposite
+    fixes, so they must not share an outcome."""
+    name = "listsig-ready-empty"
+    before = _tools_list(name, "empty_ready")
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(tools=[]), metrics=METRICS)
+    await broker._upstreams[name].probe()
+
+    assert await broker._list_tools_for(name) == []
+
+    assert _tools_list(name, "empty_ready") == before + 1
+    assert _tools_list(name, "empty_not_ready") == 0.0
+
+
+async def test_tools_list_reports_served_and_the_count() -> None:
+    """The positive control — a permanently-zero 'served' would otherwise look
+    like healthy silence."""
+    name = "listsig-served"
+    before = _tools_list(name, "served")
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), metrics=METRICS)
+    await broker._upstreams[name].probe()
+
+    tools = await broker._list_tools_for(name)
+
+    assert tools
+    assert _tools_list(name, "served") == before + 1
+    assert METRICS.tools_advertised[name] == len(tools)
+
+
+async def test_a_call_with_no_upstream_is_counted() -> None:
+    """The agent gets a polite 'not connected yet', which reads to the user as
+    the assistant being unable rather than the platform failing to route."""
+    name = "callsig-no-upstream"
+    broker = ToolBroker(
+        [(name, _URL)], dialer=_FakeDialer(), session_scoped={name}, metrics=METRICS
+    )
+    server = broker._build_server(name)
+    handler = server.request_handlers[types.CallToolRequest]
+
+    await handler(
+        types.CallToolRequest(
+            method="tools/call",
+            params=types.CallToolRequestParams(name="whatever", arguments={}),
+        )
+    )
+
+    assert METRICS.call_no_upstream.get(name, 0.0) == 1.0
+
+
+async def test_re_registering_a_session_upstream_is_recorded() -> None:
+    """The old upstream is dropped without being closed. Harmless once, a churn
+    signal in bulk — and previously indistinguishable from a first attach."""
+    name = "replace-sig"
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), metrics=METRICS)
+
+    await broker.register_session(name, "tok", _URL)
+    await broker.register_session(name, "tok", _URL)
+
+    assert METRICS.replaced.get(name, 0.0) == 1.0
+
+
+async def test_clearing_a_session_counts_what_it_dropped() -> None:
+    name = "clear-sig"
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), metrics=METRICS)
+    await broker.register_session(name, "tok-clear", _URL)
+
+    broker.clear_session("tok-clear")
+
+    assert METRICS.cleared.get(name, 0.0) == 1.0
+    assert (name, "tok-clear") not in broker._session_upstreams
+
+
+async def test_clear_session_does_not_prune_cli_sessions() -> None:
+    """Documents a real limitation rather than pretending it away: _sessions is
+    keyed by server name, not by token, so clear_session CANNOT know which
+    entries belonged to the ending session. They are pruned lazily on the next
+    failed notify, and until then each stale entry costs one notify timeout on
+    the attach path. If this ever becomes token-keyed, this test should flip."""
+    name = "clear-cli-sessions"
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), metrics=METRICS)
+    broker._sessions[name].add(_FakeSession())  # type: ignore[arg-type]
+    await broker.register_session(name, "tok-x", _URL)
+
+    broker.clear_session("tok-x")
+
+    assert len(broker._sessions[name]) == 1, "behaviour changed — update the docstring above"
