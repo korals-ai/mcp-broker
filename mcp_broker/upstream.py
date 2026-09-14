@@ -10,12 +10,23 @@ Advertising is **confirmed-lazy**: a sidecar's tools are exposed only after a
 probe has reached it at least once. So a sidecar that never comes up stays
 invisible to the agent (no phantom tool to hang on), and one that comes up late
 appears mid-session once the broker notifies (see the broker's dial loop).
+
+And it stays confirmed only while the sidecar stays reachable. The cached roster
+describes the PROCESS that answered the probe; once that process is observed
+gone (a failed call or a failed re-probe — the up→down edge) the roster is
+dropped, and whatever replaces it is probed afresh. Without that, a sidecar
+rolled to a new image behind a stable Service kept advertising its predecessor's
+tool schemas for the workspace pod's whole life (2026-09-14: two replicas of one
+tenant advertised two different ``browser_login`` signatures for the same
+browser pod).
 """
 
 from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
+import json
 import logging
 import socket
 import uuid
@@ -84,6 +95,30 @@ _UNREACHABLE_WARN_AFTER = 3
 # on Upstream.call for why this exists and why it isn't OTel trace context).
 _REQUEST_ID_HEADER = "X-Platform-Request-Id"
 
+# The closed vocabulary of inc_roster_refresh outcomes (see BrokerMetrics).
+ROSTER_REFRESH_OUTCOMES = frozenset({"dropped", "changed", "unchanged"})
+
+
+def roster_shape(tools: list[types.Tool]) -> dict[str, str]:
+    """Tool name -> a short digest of WHAT that tool advertises (description,
+    input schema, annotations), so two probes can be compared for "did the menu
+    change" — and the log can name WHICH tools moved — without diffing pydantic
+    objects. Keyed by name, so a server listing its tools in a different order
+    is not a change."""
+    shape: dict[str, str] = {}
+    for t in tools:
+        canonical = json.dumps(t.model_dump(mode="json", exclude_none=True), sort_keys=True)
+        shape[t.name] = hashlib.sha256(canonical.encode()).hexdigest()[:12]
+    return shape
+
+
+def roster_diff(before: dict[str, str], after: dict[str, str]) -> str:
+    """One line naming what changed between two roster shapes."""
+    added = sorted(after.keys() - before.keys())
+    removed = sorted(before.keys() - after.keys())
+    reshaped = sorted(n for n in after.keys() & before.keys() if after[n] != before[n])
+    return f"added={added} removed={removed} reshaped={reshaped}"
+
 
 class Upstream:
     """One workspace-tool sidecar, fronted by the broker."""
@@ -108,8 +143,20 @@ class Upstream:
         self._call_backoff_s = call_backoff_s
         self._call_timeout_s = call_timeout_s
         self._probe_timeout_s = probe_timeout_s
-        # None => never confirmed ready; the agent must not see these tools yet.
+        # None => not confirmed ready; the agent must not see these tools yet.
+        # Cleared again on the up→down edge (see _set_reachable): a roster is
+        # only ever a claim about the process that answered the last probe.
         self._tools: list[types.Tool] | None = None
+        # Shape of the last roster a probe returned. Deliberately NOT cleared
+        # with _tools, so the probe that recovers a rolled sidecar can say
+        # whether the new process advertises something different from the old
+        # one — the question a "did the deploy change the tool schema?" reader
+        # is actually asking.
+        self._shape: dict[str, str] | None = None
+        # Set on every up→down edge, cleared by whoever re-dials (the broker's
+        # dial loop waits on it, so a lost upstream is re-dialed and re-announced
+        # without the loop having to poll a ready upstream forever).
+        self._lost = asyncio.Event()
         # Monotonic time of the last probe ATTEMPT (not success) — lets the
         # broker's lazy re-probe rate-limit itself instead of paying the
         # probe timeout on every tools/list against a permanently wedged child.
@@ -158,12 +205,41 @@ class Upstream:
         self._metrics.set_upstream_ready(self._name, value)
         if not value and self._reachable:
             self._metrics.inc_upstream_exit(self._name, reason)
+            self._drop_roster(reason)
         self._reachable = value
 
+    def _drop_roster(self, reason: str) -> None:
+        """The up→down edge: forget the cached tools and wake the re-dialer.
+
+        The roster came from a process that is now gone. Keeping it would let
+        the agent plan around tool schemas the replacement may not have — and
+        because ``ready`` reads ``_tools``, dropping it also makes the next
+        ``tools/list`` report ``empty_not_ready`` honestly instead of serving a
+        menu nobody is behind."""
+        if self._tools is None:
+            return
+        log.warning(
+            "broker upstream %s lost (%s); dropping its %d cached tool(s) until it answers again",
+            self._name,
+            reason,
+            len(self._tools),
+        )
+        self._tools = None
+        self._metrics.inc_roster_refresh(self._name, "dropped")
+        self._lost.set()
+
+    async def wait_lost(self) -> None:
+        """Block until the next up→down edge, then arm for the one after."""
+        await self._lost.wait()
+        self._lost.clear()
+
     async def probe(self) -> bool:
-        """Dial the sidecar and cache its tools. Return ``True`` iff this probe
-        transitioned the upstream from not-ready to ready (the edge the broker
-        notifies on). A failed probe is swallowed — the dialer retries.
+        """Dial the sidecar and cache its tools. Return ``True`` iff open
+        sessions should be told the roster changed: the upstream just became
+        ready, OR it was already ready and the sidecar now advertises a different
+        roster (a rolled image behind the same Service). A same-roster re-probe
+        returns ``False`` so a routine refresh never fans out a ``list_changed``.
+        A failed probe is swallowed — the dialer retries.
 
         Bounded by ``probe_timeout_s`` end to end (dial + initialize + list):
         a server whose transport session crashed mid-initialize accepts the
@@ -190,10 +266,35 @@ class Upstream:
             self._set_reachable(False, reason="probe_unreachable")
             return False
         self._note_probe_success()
+        changed = self._note_roster(tools)
         self._tools = tools
         self._metrics.inc_child_probe(self._name, "reachable")
         self._set_reachable(True, reason="probe_ok")
-        return not was_ready
+        return changed or not was_ready
+
+    def _note_roster(self, tools: list[types.Tool]) -> bool:
+        """Compare a freshly probed roster with the last one seen and record the
+        verdict. ``True`` iff it differs from a previously seen roster. The first
+        roster ever seen is neither changed nor unchanged — there is nothing to
+        compare it to — and is reported by ``inc_child_probe`` alone."""
+        shape = roster_shape(tools)
+        prev = self._shape
+        self._shape = shape
+        if prev is None:
+            return False
+        if shape == prev:
+            self._metrics.inc_roster_refresh(self._name, "unchanged")
+            return False
+        self._metrics.inc_roster_refresh(self._name, "changed")
+        log.warning(
+            "broker upstream %s roster changed (%d -> %d tools; %s); "
+            "open sessions will be told to re-list",
+            self._name,
+            len(prev),
+            len(shape),
+            roster_diff(prev, shape),
+        )
+        return True
 
     def _note_probe_failure(self, detail: str) -> None:
         """Count a failed probe and escalate to WARNING once it's clearly not a

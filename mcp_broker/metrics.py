@@ -112,6 +112,23 @@ class BrokerMetrics(Protocol):
         its tools. A number that does not return to zero is the shape of a
         connector that is connected and invisible."""
 
+    def inc_roster_refresh(self, name: str, outcome: str) -> None:
+        """The cached tool roster for ``name`` was re-derived from the live
+        upstream, or discarded. ``outcome``:
+
+        * ``dropped``   — the upstream was observed gone (a failed call or a
+          failed re-probe after it had been ready) and its roster was
+          forgotten; the dial loop re-announces it once it answers again.
+        * ``changed``   — a re-probe returned a roster that differs from the
+          last one seen (a rolled sidecar image, typically). Open sessions are
+          told to re-list.
+        * ``unchanged`` — a re-probe returned the same roster. The routine
+          case; it is what makes ``changed`` a rate worth alerting on.
+
+        Before this existed a sidecar that rolled behind a stable Service kept
+        its predecessor's schemas advertised for the workspace pod's whole
+        life, and nothing counted it (2026-09-14)."""
+
 
 class NullMetrics:
     """The default: report nothing.
@@ -157,6 +174,9 @@ class NullMetrics:
         return None
 
     def set_pending_heals(self, name: str, count: int) -> None:
+        return None
+
+    def inc_roster_refresh(self, name: str, outcome: str) -> None:
         return None
 
 

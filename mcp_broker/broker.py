@@ -371,13 +371,26 @@ class ToolBroker:
 
     async def _list_tools_for(self, name: str) -> list[types.Tool]:
         """The ``tools/list`` body for one sidecar: the routed upstream's
-        cached roster. A not-ready per-user child is re-probed lazily here —
-        it lost the startup race (registered before it listened and
-        register_session's budget ran out) and has no dial loop to heal it,
-        so the CLI's next list is its only recovery point. No-op once ready,
-        and rate-limited so a permanently wedged child (crashed transport,
-        e.g. unreachable Odoo host) costs at most one probe timeout per
-        window instead of one per list."""
+        cached roster, re-confirmed against the live sidecar when it has not
+        been probed recently.
+
+        Two reasons to probe here, one rate limit for both:
+
+        * A READY upstream is re-probed so the roster served is the roster the
+          sidecar has NOW — a sidecar rolled to a new image behind its stable
+          Service otherwise stays advertised as its predecessor for the pod's
+          whole life (2026-09-14). A changed roster fans out ``list_changed``
+          so every open session re-lists, not only the one that asked.
+        * A not-ready per-user child is re-probed because it lost the startup
+          race (registered before it listened and register_session's budget
+          ran out) and has no dial loop to heal it, so the CLI's next list is
+          its only recovery point. Static sidecars are NOT in this branch:
+          their dial loop owns recovery, and a wedged one would otherwise cost
+          every new session a probe timeout on its first list.
+
+        Rate-limited so a permanently wedged child (crashed transport, e.g.
+        unreachable Odoo host) costs at most one probe timeout per window
+        instead of one per list."""
         token = _CURRENT_TOKEN.get()
         up = self._upstream_for(name)
         if up is None:
@@ -402,12 +415,9 @@ class ToolBroker:
                 name in self._session_scoped,
             )
             return []
-        if (
-            not up.ready
-            and name in self._session_scoped
-            and not up.probed_recently(self._probe_timeout_s * 2)
-        ):
-            await up.probe()
+        stale = not up.probed_recently(self._probe_timeout_s * 2)
+        if stale and (up.ready or name in self._session_scoped) and await up.probe():
+            await self._notify(name)
         tools = up.tools()
         if tools:
             outcome = "served"
@@ -536,8 +546,26 @@ class ToolBroker:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _dial_loop(self, name: str) -> None:
-        """Probe one sidecar with exponential backoff until it is ready (then
-        notify open sessions) or the give-up cap is reached (then alert)."""
+        """Own one sidecar's readiness for the pod's life: dial it with
+        exponential backoff until it is ready (then notify open sessions), then
+        sleep until the upstream reports itself lost (the up→down edge a failed
+        call or re-probe records), and dial again. Each dial phase has its own
+        give-up cap; a sidecar that never comes up within it is alerted and
+        abandoned, since no down-edge will ever wake this loop for it.
+
+        The loop used to RETURN once ready, so a sidecar that rolled behind its
+        Service — new process, possibly new tool schemas — was never re-probed
+        and never re-announced to open sessions (2026-09-14)."""
+        upstream = self._upstreams[name]
+        while True:
+            if not await self._dial_until_ready(name):
+                return
+            await upstream.wait_lost()
+            log.info("broker upstream %s lost; re-dialing", name)
+
+    async def _dial_until_ready(self, name: str) -> bool:
+        """One dial phase. ``True`` once the upstream is ready (open sessions
+        notified if the roster is new to them); ``False`` on give-up."""
         upstream = self._upstreams[name]
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._giveup_after_s
@@ -552,7 +580,7 @@ class ToolBroker:
                         len(self._sessions[name]),
                     )
                     await self._notify(name)
-                return
+                return True
             if loop.time() >= deadline:
                 self._metrics.inc_upstream_giveup(name)
                 log.warning(
@@ -560,7 +588,7 @@ class ToolBroker:
                     name,
                     self._giveup_after_s,
                 )
-                return
+                return False
             await asyncio.sleep(delay)
             delay = min(delay * 2, self._poll_max_s)
 

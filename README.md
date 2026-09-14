@@ -131,6 +131,13 @@ with the default set.
 - **Reachability is honest in both directions.** A probe or call that fails after
   an upstream was ready marks it not-ready again; a live upstream that drops
   reports one exit, on the edge, not one per failed call.
+- **The roster follows the process, not the address.** An upstream observed gone
+  has its cached tools dropped, and the dial loop re-dials it and re-announces
+  whatever answers next — so an upstream restarted with a different tool set
+  (a new image behind the same address) is re-listed by open sessions, not
+  served as its predecessor. A `tools/list` on an upstream that has not been
+  probed recently re-confirms the roster too, and fans out `listChanged` only if
+  it actually changed.
 - **Per-session routing.** An upstream can be marked session-scoped and resolved
   per session token instead of to one static address — for tools that need
   per-user credentials.

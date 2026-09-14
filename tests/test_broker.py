@@ -283,6 +283,7 @@ class RecordingMetrics:
         self.cli_sessions: dict[str, int] = {}
         self.heals: dict[tuple[str, str], float] = {}
         self.pending_heals: dict[str, int] = {}
+        self.roster_refreshes: dict[tuple[str, str], float] = {}
 
     def set_upstream_ready(self, name: str, ready: bool) -> None:
         self.ready[name] = 1.0 if ready else 0.0
@@ -325,6 +326,10 @@ class RecordingMetrics:
 
     def set_pending_heals(self, name: str, count: int) -> None:
         self.pending_heals[name] = count
+
+    def inc_roster_refresh(self, name: str, outcome: str) -> None:
+        key = (name, outcome)
+        self.roster_refreshes[key] = self.roster_refreshes.get(key, 0.0) + 1.0
 
 
 # One recorder per module run; each test uses its own upstream name, matching how
@@ -391,8 +396,8 @@ async def test_upstream_ready_then_down_counts_exit_once() -> None:
 
 async def test_upstream_recovers_flips_gauge_back_ready() -> None:
     """R17: after a down blip, a successful call flips the gauge back to 1 — the
-    broker never re-probes a ready upstream, so the call path is the only signal
-    that can recover it."""
+    call path is the fastest reachability signal there is (a re-probe waits for
+    the dial loop or the next rate-limited tools/list)."""
     name = "workspace-tool-r17recover"
     dialer = _FlakyDialer()
     up = Upstream(name, _URL, dialer=dialer, call_retries=0, call_backoff_s=0.0, metrics=METRICS)
@@ -460,7 +465,7 @@ async def test_dial_loop_notifies_when_slow_sidecar_comes_up() -> None:
     session = _FakeSession()
     broker._sessions[_OFFICE].add(session)  # type: ignore[arg-type]
 
-    await broker._dial_loop(_OFFICE)
+    assert await broker._dial_until_ready(_OFFICE) is True
 
     assert broker._upstreams[_OFFICE].ready is True
     assert session.notified == 1  # tools/list_changed pushed exactly once
@@ -480,7 +485,9 @@ async def test_dial_loop_gives_up_and_alerts_on_dead_sidecar() -> None:
     session = _FakeSession()
     broker._sessions[_OFFICE].add(session)  # type: ignore[arg-type]
 
-    await broker._dial_loop(_OFFICE)
+    # The whole loop returns on give-up: nothing will ever wake it (no
+    # down-edge can come from an upstream that never came up).
+    await asyncio.wait_for(broker._dial_loop(_OFFICE), timeout=2.0)
 
     assert broker._upstreams[_OFFICE].ready is False
     assert session.notified == 0  # never advertised, so never notified
