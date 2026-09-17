@@ -11,19 +11,29 @@ from __future__ import annotations
 from mcp_broker.broker import BROKER_PATH_PREFIX, ToolBroker, broker_route
 from mcp_broker.dialer import Dialer, UpstreamConn, default_dialer
 from mcp_broker.metrics import NULL_METRICS, BrokerMetrics, NullMetrics
+from mcp_broker.result_filter import (
+    NULL_RESULT_FILTER,
+    NullResultFilter,
+    ResultFilter,
+    withheld_result,
+)
 from mcp_broker.roster import parse_roster
 from mcp_broker.upstream import Upstream
 
 __all__ = [
     "BROKER_PATH_PREFIX",
     "NULL_METRICS",
+    "NULL_RESULT_FILTER",
     "BrokerMetrics",
     "Dialer",
     "NullMetrics",
+    "NullResultFilter",
+    "ResultFilter",
     "ToolBroker",
     "Upstream",
     "UpstreamConn",
     "broker_route",
     "default_dialer",
     "parse_roster",
+    "withheld_result",
 ]

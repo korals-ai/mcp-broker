@@ -41,6 +41,7 @@ from starlette.types import ASGIApp
 
 from mcp_broker.dialer import Dialer, default_dialer
 from mcp_broker.metrics import NULL_METRICS, BrokerMetrics
+from mcp_broker.result_filter import NULL_RESULT_FILTER, ResultFilter, withheld_result
 from mcp_broker.upstream import Upstream
 
 log = logging.getLogger("workspace.tool_broker")
@@ -137,10 +138,15 @@ class ToolBroker:
         probe_timeout_s: float = 5.0,
         notify_timeout_s: float = 2.0,
         metrics: BrokerMetrics = NULL_METRICS,
+        result_filter: ResultFilter = NULL_RESULT_FILTER,
     ) -> None:
         dial = dialer or default_dialer(connect_timeout_s)
         self._dial = dial
         self._metrics = metrics
+        # Every proxied tool result passes through this before the agent sees
+        # it (see mcp_broker.result_filter). A gate, not a hook: a filter that
+        # raises withholds the result rather than letting it through unfiltered.
+        self._result_filter = result_filter
         self._call_timeout_s = call_timeout_s
         self._poll_min_s = poll_min_s
         self._poll_max_s = poll_max_s
@@ -204,6 +210,7 @@ class ToolBroker:
         dialer: Dialer | None = None,
         session_scoped: set[str] | None = None,
         metrics: BrokerMetrics = NULL_METRICS,
+        result_filter: ResultFilter = NULL_RESULT_FILTER,
     ) -> ToolBroker:
         """Construct from ``MCP_BROKER_*`` env knobs (the defaults below if unset).
 
@@ -223,6 +230,7 @@ class ToolBroker:
             dialer=dialer,
             session_scoped=session_scoped,
             metrics=metrics,
+            result_filter=result_filter,
             connect_timeout_s=_f("MCP_BROKER_CONNECT_TIMEOUT_S", 5.0),
             poll_min_s=_f("MCP_BROKER_POLL_MIN_S", 0.5),
             poll_max_s=_f("MCP_BROKER_POLL_MAX_S", 8.0),
@@ -538,7 +546,25 @@ class ToolBroker:
                     ],
                     isError=True,
                 )
-            return await up.call(tool_name, arguments, chat_id=_CURRENT_CHAT_ID.get())
+            chat_id = _CURRENT_CHAT_ID.get()
+            result = await up.call(tool_name, arguments, chat_id=chat_id)
+            try:
+                return await self._result_filter.filter_result(
+                    name, tool_name, arguments, result, chat_id=chat_id
+                )
+            except Exception:
+                # Fail CLOSED: the host installed a filter to enforce something,
+                # so a filter that cannot decide must not let the raw result out.
+                log.exception(
+                    "broker result filter raised on %s.%s (chat_id=%s); withholding the result",
+                    name,
+                    tool_name,
+                    chat_id or "-",
+                )
+                return withheld_result(
+                    f"The '{tool_name}' result could not be checked before returning it "
+                    "to you — try again in a moment."
+                )
 
         return server
 

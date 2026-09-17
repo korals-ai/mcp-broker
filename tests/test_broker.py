@@ -26,7 +26,7 @@ from typing import Any
 import mcp.types as types
 import pytest
 
-from mcp_broker.broker import _CURRENT_TOKEN, ToolBroker
+from mcp_broker.broker import _CURRENT_CHAT_ID, _CURRENT_TOKEN, ToolBroker
 from mcp_broker.upstream import _UNREACHABLE_WARN_AFTER, Upstream, classify_probe_result
 
 _OFFICE = "workspace-tool-office"
@@ -842,3 +842,99 @@ async def test_an_empty_list_separates_a_missing_token_from_an_unattached_child(
 
     assert no_token == 1.0
     assert _tools_list(name, "empty_unregistered") == 1.0
+
+
+# --- The result-filter seam ---------------------------------------------------
+
+
+class _RecordingFilter:
+    """A ResultFilter that records every call and either rewrites, passes
+    through, or raises — the three behaviours the seam's contract covers."""
+
+    def __init__(
+        self, *, replace_with: types.CallToolResult | None = None, raise_: bool = False
+    ) -> None:
+        self.replace_with = replace_with
+        self.raise_ = raise_
+        self.seen: list[tuple[str, str, dict[str, Any], types.CallToolResult, str | None]] = []
+
+    async def filter_result(
+        self,
+        name: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: types.CallToolResult,
+        *,
+        chat_id: str | None,
+    ) -> types.CallToolResult:
+        self.seen.append((name, tool_name, arguments, result, chat_id))
+        if self.raise_:
+            raise RuntimeError("filter bug")
+        return self.replace_with or result
+
+
+async def _proxy_call(broker: ToolBroker, name: str, tool: str = "convert") -> types.CallToolResult:
+    handler = broker._build_server(name).request_handlers[types.CallToolRequest]
+    res = await handler(
+        types.CallToolRequest(
+            method="tools/call",
+            params=types.CallToolRequestParams(name=tool, arguments={"a": 1}),
+        )
+    )
+    return res.root  # type: ignore[return-value]  # ServerResult wraps the CallToolResult
+
+
+async def test_result_filter_sees_the_call_and_its_answer_is_what_the_agent_gets() -> None:
+    """The seam's whole point: the filter receives the upstream's real answer
+    (plus who called what, under which chat) and whatever it returns is what
+    reaches the agent — the raw result never bypasses it."""
+    name = "filter-rewrite"
+    rewritten = types.CallToolResult(content=[types.TextContent(type="text", text="rewritten")])
+    flt = _RecordingFilter(replace_with=rewritten)
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), result_filter=flt)
+
+    reset = _CURRENT_CHAT_ID.set("chat-42")
+    try:
+        got = await _proxy_call(broker, name)
+    finally:
+        _CURRENT_CHAT_ID.reset(reset)
+
+    assert got.content[0].text == "rewritten"  # type: ignore[union-attr]
+    ((seen_name, seen_tool, seen_args, seen_result, seen_chat),) = flt.seen
+    assert (seen_name, seen_tool, seen_args, seen_chat) == (name, "convert", {"a": 1}, "chat-42")
+    assert seen_result.content[0].text == "ran convert"  # type: ignore[union-attr]
+
+
+async def test_default_filter_passes_the_upstream_answer_through() -> None:
+    name = "filter-default"
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer())
+
+    got = await _proxy_call(broker, name)
+
+    assert got.isError is False
+    assert got.content[0].text == "ran convert"  # type: ignore[union-attr]
+
+
+async def test_a_raising_filter_withholds_the_result_instead_of_leaking_it() -> None:
+    """A host installs a filter to ENFORCE something (visibility, redaction).
+    A bug in it must fail closed: the agent gets an error result, and the
+    upstream's unfiltered answer never reaches it."""
+    name = "filter-raises"
+    flt = _RecordingFilter(raise_=True)
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), result_filter=flt)
+
+    got = await _proxy_call(broker, name)
+
+    assert got.isError is True
+    assert "ran convert" not in got.content[0].text  # type: ignore[union-attr]
+    assert len(flt.seen) == 1  # it was consulted, it just could not decide
+
+
+async def test_filter_gets_none_chat_id_when_the_url_carried_none() -> None:
+    name = "filter-no-chat"
+    flt = _RecordingFilter()
+    broker = ToolBroker([(name, _URL)], dialer=_FakeDialer(), result_filter=flt)
+
+    await _proxy_call(broker, name)
+
+    assert flt.seen[0][4] is None

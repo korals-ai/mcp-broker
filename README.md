@@ -158,6 +158,24 @@ ToolBroker.from_env(roster, metrics=MyMetrics())
 The default reports nothing. `set_upstream_ready` is the series worth graphing
 first: a tool silently missing from your agent is that going 0.
 
+## Gating results
+
+Every proxied tool result passes through one `ResultFilter` before the agent
+sees it — the seam for a host-side visibility rule, a redaction pass, or a
+size cap:
+
+```python
+class MyFilter:
+    async def filter_result(self, name, tool_name, arguments, result, *, chat_id):
+        return result  # or a rewritten CallToolResult
+
+ToolBroker.from_env(roster, result_filter=MyFilter())
+```
+
+The default passes everything through. It is a gate, not a hook: a filter that
+raises makes the agent receive an error result, never the unfiltered one —
+whatever the host is enforcing fails closed.
+
 ## Tuning
 
 `ToolBroker.from_env` reads `MCP_BROKER_CONNECT_TIMEOUT_S`,
