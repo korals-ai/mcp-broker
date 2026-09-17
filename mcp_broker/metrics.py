@@ -72,6 +72,9 @@ class BrokerMetrics(Protocol):
         * ``empty_ready``       — the upstream IS ready and genuinely advertises
           zero tools. A child in this state is misconfigured, not absent, and
           the two demand opposite fixes.
+        * ``empty_retired``     — the request's session token was registered
+          and later cleared, yet a CLI still lists under it: the agent outlived
+          its routing key. Never heals on its own.
         """
 
     def set_tools_advertised(self, name: str, count: int) -> None:

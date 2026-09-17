@@ -28,6 +28,7 @@ import contextlib
 import contextvars
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import parse_qs
@@ -43,6 +44,11 @@ from mcp_broker.metrics import NULL_METRICS, BrokerMetrics
 from mcp_broker.upstream import Upstream
 
 log = logging.getLogger("workspace.tool_broker")
+
+# How many cleared session tokens the broker remembers, to tell a CLI listing
+# under a retired token from one whose token was never registered. A token is
+# ~40 bytes; the cap bounds memory on a long-lived pod, not correctness.
+_RETIRED_TOKENS_MAX = 1024
 
 # URL path the agent's MCP client reaches a fronted sidecar at, e.g.
 # http://localhost:8080/_broker/workspace-tool-office/mcp. The "_broker" prefix
@@ -179,6 +185,12 @@ class ToolBroker:
         # the CLI" and "the agent ended up with the tools" are different
         # events, and only the second one is what the user experiences.
         self._pending_heal: dict[tuple[str, str], float] = {}
+        # Session tokens cleared by clear_session, most recent last, bounded.
+        # A CLI still listing under one of these is a session the embedder
+        # declared ended while its agent is plainly alive — a routing key the
+        # embedder retired under a running agent. Without this it reads as
+        # ``empty_unregistered``, the ordinary startup race, and nobody looks.
+        self._retired_tokens: OrderedDict[str, None] = OrderedDict()
         self._managers: dict[str, StreamableHTTPSessionManager] = {
             name: StreamableHTTPSessionManager(app=self._build_server(name), stateless=False)
             for name in self._upstreams
@@ -270,6 +282,7 @@ class ToolBroker:
         tools went missing, which is the first question anyone asks."""
         if chat_id:
             self._token_chat[token] = chat_id
+        self._retired_tokens.pop(token, None)
         # metrics threaded deliberately: session children have no dial loop, so
         # the probe counter (child_probe seam) is the ONLY health signal a
         # broken per-user child emits — without it a down child is metric-dark
@@ -367,7 +380,13 @@ class ToolBroker:
             )
             del self._pending_heal[key]
             self._metrics.set_pending_heals(key[0], self._pending_heal_count(key[0]))
-        self._token_chat.pop(token, None)
+        self._retired_tokens[token] = None
+        self._retired_tokens.move_to_end(token)
+        while len(self._retired_tokens) > _RETIRED_TOKENS_MAX:
+            oldest, _ = self._retired_tokens.popitem(last=False)
+            self._token_chat.pop(oldest, None)
+        # Kept past the clear so a retired-token list can still be attributed.
+        # Bounded by the same cap: dropped when the token leaves the retired set.
 
     async def _list_tools_for(self, name: str) -> list[types.Tool]:
         """The ``tools/list`` body for one sidecar: the routed upstream's
@@ -403,7 +422,16 @@ class ToolBroker:
             #   unregistered  - the token is fine, the child just is not
             #                   attached yet. Ordinary startup, heals on the
             #                   listChanged re-list. A RACE.
-            outcome = "empty_unregistered" if token else "empty_no_token"
+            #   retired       - the token WAS registered and the embedder cleared
+            #                   it, yet a CLI is still listing under it: the
+            #                   agent outlived its routing key. A BUG, and
+            #                   unlike unregistered it never heals.
+            if not token:
+                outcome = "empty_no_token"
+            elif token in self._retired_tokens:
+                outcome = "empty_retired"
+            else:
+                outcome = "empty_unregistered"
             self._metrics.inc_tools_list(name, outcome)
             self._metrics.set_tools_advertised(name, 0)
             log.warning(
@@ -492,10 +520,11 @@ class ToolBroker:
                 self._metrics.inc_call_no_upstream(name)
                 log.warning(
                     "broker call %s.%s -> NO UPSTREAM for this session; returning "
-                    "'not connected' to the agent (token_present=%s)",
+                    "'not connected' to the agent (token_present=%s retired=%s)",
                     name,
                     tool_name,
                     _CURRENT_TOKEN.get() is not None,
+                    _CURRENT_TOKEN.get() in self._retired_tokens,
                 )
                 return types.CallToolResult(
                     content=[

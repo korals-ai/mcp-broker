@@ -444,3 +444,63 @@ async def test_session_child_failed_probe_reports_through_the_metrics_seam() -> 
     name, result = metrics.child_probes[-1]
     assert name == _ODOO
     assert result != "reachable"
+
+
+# ---- retired tokens --------------------------------------------------------
+
+
+async def _list_as(broker: ToolBroker, token: str | None) -> list[types.Tool]:
+    reset = _CURRENT_TOKEN.set(token)
+    try:
+        return await broker._list_tools_for(_ODOO)
+    finally:
+        _CURRENT_TOKEN.reset(reset)
+
+
+async def test_listing_under_a_cleared_token_is_counted_retired_not_unregistered() -> None:
+    """A CLI still listing under a token the embedder cleared outlived its
+    routing key: that never heals, unlike a token not registered YET. Both
+    return an empty roster, so only the outcome label can tell them apart."""
+    metrics = _RecordingMetrics()
+    broker = ToolBroker(
+        [(_ODOO, _CONTROL_URL)],
+        dialer=_RecordingDialer([_tool("odoo_search")]),
+        session_scoped={_ODOO},
+        metrics=metrics,
+    )
+    await broker.register_session(_ODOO, "tok-alice", "http://127.0.0.1:8100/mcp")
+    broker.clear_session("tok-alice")
+
+    assert await _list_as(broker, "tok-alice") == []
+    assert await _list_as(broker, "tok-never") == []
+    assert (_ODOO, "empty_retired") in metrics.tools_lists
+    assert (_ODOO, "empty_unregistered") in metrics.tools_lists
+    assert metrics.tools_lists.count((_ODOO, "empty_retired")) == 1
+
+
+async def test_re_registering_a_retired_token_un_retires_it() -> None:
+    metrics = _RecordingMetrics()
+    broker = ToolBroker(
+        [(_ODOO, _CONTROL_URL)],
+        dialer=_RecordingDialer([_tool("odoo_search")]),
+        session_scoped={_ODOO},
+        metrics=metrics,
+    )
+    await broker.register_session(_ODOO, "tok-alice", "http://127.0.0.1:8100/mcp")
+    broker.clear_session("tok-alice")
+    await broker.register_session(_ODOO, "tok-alice", "http://127.0.0.1:8100/mcp")
+
+    assert [t.name for t in await _list_as(broker, "tok-alice")] == ["odoo_search"]
+    assert (_ODOO, "empty_retired") not in metrics.tools_lists
+
+
+async def test_retired_token_memory_is_bounded(monkeypatch: Any) -> None:
+    from mcp_broker import broker as broker_module
+
+    monkeypatch.setattr(broker_module, "_RETIRED_TOKENS_MAX", 2)
+    broker = _broker(_RecordingDialer([_tool("odoo_search")]))
+    for token in ("t1", "t2", "t3"):
+        await broker.register_session(_ODOO, token, "http://127.0.0.1:8100/mcp", chat_id="c")
+        broker.clear_session(token)
+    assert list(broker._retired_tokens) == ["t2", "t3"]
+    assert "t1" not in broker._token_chat  # attribution leaves with the token
