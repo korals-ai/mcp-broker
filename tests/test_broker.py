@@ -938,3 +938,110 @@ async def test_filter_gets_none_chat_id_when_the_url_carried_none() -> None:
     await _proxy_call(broker, name)
 
     assert flt.seen[0][4] is None
+
+
+# --- a 404 is the sidecar ANSWERING, not exiting (2026-09-18) -----------------
+#
+# A warm agent on a retired session token re-listed after another session's
+# attach notify; the router in front of the children 404'd the token and the
+# broker counted a sidecar exit for a sidecar that never restarted.
+
+
+def _mcp_client_404() -> BaseException:
+    """What the real ``mcp`` streamable-HTTP client raises on an HTTP 404: its
+    synthesised session-terminated JSON-RPC error inside a TaskGroup group."""
+    from mcp.shared.exceptions import McpError
+
+    inner = McpError(types.ErrorData(code=32600, message="Session terminated"))
+    return ExceptionGroup("unhandled errors in a TaskGroup", [inner])
+
+
+class _StatusError(Exception):
+    """httpx.HTTPStatusError's shape: a ``.response`` with a ``.status_code``."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"Server error '{status}'")
+        self.response = type("R", (), {"status_code": status})()
+
+
+class _SwitchDialer(_FakeDialer):
+    """Answers normally until ``.fail_with`` is set, then raises that on every dial."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_with: BaseException | None = None
+
+    @contextlib.asynccontextmanager
+    async def __call__(  # type: ignore[override]
+        self, url: str, *, headers: dict[str, str] | None = None
+    ) -> AsyncIterator[_FakeConn]:
+        self.dials += 1
+        if self.fail_with is not None:
+            raise self.fail_with
+        yield _FakeConn(self)
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (_mcp_client_404(), "session_unknown"),
+        (_StatusError(404), "session_unknown"),
+        (_StatusError(502), "http_error"),
+        # The group walk also un-blinds conn_refused: on prod the cause/context
+        # walk never looked inside the mcp client's ExceptionGroup, so 7 days
+        # read 12,385 http_error and 0 conn_refused.
+        (
+            ExceptionGroup("tg", [ConnectionRefusedError(errno.ECONNREFUSED, "refused")]),
+            "conn_refused",
+        ),
+    ],
+)
+def test_classify_probe_result_reads_inside_exception_groups(
+    exc: BaseException, expected: str
+) -> None:
+    assert classify_probe_result(exc) == expected
+
+
+async def test_probe_404_drops_roster_without_counting_an_exit() -> None:
+    m = RecordingMetrics()
+    dialer = _SwitchDialer()
+    up = Upstream("workspace-tool-zoho", _URL, dialer=dialer, metrics=m)
+    assert await up.probe() is True
+
+    dialer.fail_with = _mcp_client_404()
+    assert await up.probe() is False
+
+    assert up.ready is False and up.tools() == []  # calls under it cannot work
+    assert m.ready["workspace-tool-zoho"] == 0.0
+    assert m.probes.get(("workspace-tool-zoho", "session_unknown")) == 1.0
+    assert m.exits == {}  # the sidecar answered; nothing exited
+
+
+async def test_call_404_is_not_retried_and_not_an_exit() -> None:
+    m = RecordingMetrics()
+    dialer = _SwitchDialer()
+    up = Upstream("workspace-tool-zoho", _URL, dialer=dialer, call_backoff_s=0.0, metrics=m)
+    assert await up.probe() is True
+
+    dialer.fail_with = _mcp_client_404()
+    dials_before = dialer.dials
+    result = await up.call("zoho_list", {})
+
+    assert result.isError is True
+    assert dialer.dials == dials_before + 1  # a 404 is final: no retry budget spent
+    assert m.exits == {}
+
+
+async def test_probe_502_after_ready_still_counts_an_exit() -> None:
+    """The control: a child really gone behind a live router answers 502, and
+    that IS the sidecar exit the alert exists for."""
+    m = RecordingMetrics()
+    dialer = _SwitchDialer()
+    up = Upstream("workspace-tool-zoho", _URL, dialer=dialer, metrics=m)
+    assert await up.probe() is True
+
+    dialer.fail_with = ExceptionGroup("tg", [_StatusError(502)])
+    assert await up.probe() is False
+
+    assert m.exits == {("workspace-tool-zoho", "probe_unreachable"): 1.0}
+    assert m.probes.get(("workspace-tool-zoho", "http_error")) == 1.0

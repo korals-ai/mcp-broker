@@ -45,33 +45,83 @@ log = logging.getLogger("workspace.tool_broker")
 # unseeded label is absent-until-first-increment, so a result that never happens
 # to fire reads as "no data" instead of 0). A join test pins the consumer's label
 # set to this constant, so adding a result here without seeding it fails loudly.
-PROBE_RESULTS = frozenset({"reachable", "timeout", "conn_refused", "dns_fail", "http_error"})
+PROBE_RESULTS = frozenset(
+    {"reachable", "timeout", "conn_refused", "dns_fail", "session_unknown", "http_error"}
+)
+
+# Up→down reasons that are NOT a sidecar exit: the sidecar answered, it just no
+# longer knows this session's token (a router in front of per-session children
+# 404s a detached token). Dropping the roster is still right — calls under that
+# token cannot succeed — but counting it as an exit raised a sidecar-exit alert
+# for a sidecar that never restarted: a warm agent on a retired token re-listed
+# after ANOTHER session's attach notify. In one measured week that shape was
+# 32 of 35 exit edges on session-scoped connectors.
+_NOT_AN_EXIT = frozenset({"probe_session_unknown", "call_session_unknown"})
+
+
+def _exception_tree(exc: BaseException) -> list[BaseException]:
+    """``exc`` plus everything reachable through ``__cause__`` / ``__context__``
+    AND ``ExceptionGroup`` members — the mcp client surfaces a failed request as
+    a TaskGroup ``ExceptionGroup`` whose real error sits inside ``.exceptions``,
+    where a cause/context walk alone never looks."""
+    seen: set[int] = set()
+    out: list[BaseException] = []
+    stack: list[BaseException] = [exc]
+    while stack:
+        cur = stack.pop(0)
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        out.append(cur)
+        if isinstance(cur, BaseExceptionGroup):
+            stack.extend(cur.exceptions)
+        stack.extend(nxt for nxt in (cur.__cause__, cur.__context__) if nxt is not None)
+    return out
+
+
+# How the ``mcp`` streamable-HTTP client reports an HTTP 404 on a request: not
+# as an HTTP error but as a JSON-RPC error it synthesises itself —
+# ``ErrorData(code=32600, message="Session terminated")`` (positive 32600, the
+# client's own constant). The broker dials a FRESH session per operation, so a
+# 404 on it can only mean the URL itself is unknown: the data router's reply to
+# a token it no longer holds.
+_MCP_CLIENT_404_CODE = 32600
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    """Whether ``exc`` is the upstream answering 404, duck-typed so the broker
+    stays independent of the transport library: the ``mcp`` client's
+    synthesised session-terminated error, or an HTTP error carrying
+    ``.response.status_code == 404`` (a plain-HTTP dialer)."""
+    if getattr(getattr(exc, "error", None), "code", None) == _MCP_CLIENT_404_CODE:
+        return True
+    return getattr(getattr(exc, "response", None), "status_code", None) == 404
 
 
 def classify_probe_result(exc: BaseException | None) -> str:
     """Map a probe outcome to the low-cardinality ``inc_child_probe`` axis:
     ``reachable`` (exc is None) | ``timeout`` | ``conn_refused`` | ``dns_fail`` |
-    ``http_error``. Transport-library-agnostic on purpose — the broker mustn't
+    ``session_unknown`` | ``http_error``. Transport-library-agnostic on purpose — the broker mustn't
     depend on httpx's exception classes — so it walks the ``__cause__`` /
     ``__context__`` chain for an ``OSError`` errno (the ground truth httpx wraps)
     and falls back to type-name / message heuristics. The distinction is the
     whole point: ``conn_refused`` = the pod answered but nothing is listening (a
     child *bind* gap), ``timeout`` = the dial blackholed (a *routing*/Service
-    gap), ``dns_fail`` = the roster host doesn't resolve; a bare bool folds all
-    three into one indistinguishable "not ready"."""
+    gap), ``dns_fail`` = the roster host doesn't resolve, ``session_unknown`` =
+    the sidecar ANSWERED 404 (it is up; it no longer knows this session's
+    token); a bare bool folds all of these into one indistinguishable "not
+    ready"."""
     if exc is None:
         return "reachable"
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
+    for cur in _exception_tree(exc):
         if isinstance(cur, TimeoutError | asyncio.TimeoutError):
             return "timeout"
         if isinstance(cur, socket.gaierror):
             return "dns_fail"
         if isinstance(cur, OSError) and cur.errno == errno.ECONNREFUSED:
             return "conn_refused"
-        cur = cur.__cause__ or cur.__context__
+        if _is_not_found(cur):
+            return "session_unknown"
     text = f"{type(exc).__name__}: {exc}".lower()
     _dns = ("name or service not known", "nodename nor servname", "temporary failure in name")
     if "timeout" in text or "timed out" in text:
@@ -201,10 +251,12 @@ class Upstream:
         skew it). Emits ``workspace_sidecar_exit_total`` ONLY on the up→down
         EDGE (was reachable, now not), so a sidecar that OOMs counts one exit,
         not one per failed call. A concurrent-failure double-count is possible
-        and harmless — the alert keys on ``rate() > 0``, not an exact tally."""
+        and harmless — the alert keys on ``rate() > 0``, not an exact tally.
+        A ``_NOT_AN_EXIT`` reason drops the roster without counting an exit."""
         self._metrics.set_upstream_ready(self._name, value)
         if not value and self._reachable:
-            self._metrics.inc_upstream_exit(self._name, reason)
+            if reason not in _NOT_AN_EXIT:
+                self._metrics.inc_upstream_exit(self._name, reason)
             self._drop_roster(reason)
         self._reachable = value
 
@@ -262,8 +314,14 @@ class Upstream:
             return False
         except Exception as exc:  # any dial/list failure means "not up yet"
             self._note_probe_failure(f"{type(exc).__name__}: {exc}")
-            self._metrics.inc_child_probe(self._name, classify_probe_result(exc))
-            self._set_reachable(False, reason="probe_unreachable")
+            result = classify_probe_result(exc)
+            self._metrics.inc_child_probe(self._name, result)
+            self._set_reachable(
+                False,
+                reason="probe_session_unknown"
+                if result == "session_unknown"
+                else "probe_unreachable",
+            )
             return False
         self._note_probe_success()
         changed = self._note_roster(tools)
@@ -406,12 +464,17 @@ class Upstream:
                 )
             except Exception as exc:  # degrade, don't crash the chat
                 last_exc = exc
+                # A 404 is the sidecar's final answer for this token, not a
+                # restart in progress; retrying only delays the agent.
+                if classify_probe_result(exc) == "session_unknown":
+                    break
                 if attempt < self._call_retries:
                     await asyncio.sleep(self._call_backoff_s * (attempt + 1))
         log.warning(
             "broker upstream %s call %s failed after retries: %s", self._name, tool_name, last_exc
         )
-        self._set_reachable(False, reason="call_unreachable")
+        unknown = last_exc is not None and classify_probe_result(last_exc) == "session_unknown"
+        self._set_reachable(False, reason="call_session_unknown" if unknown else "call_unreachable")
         return self._unavailable(
             f"not reachable after {self._call_retries + 1} attempts; it may be starting or restarting"
         )
