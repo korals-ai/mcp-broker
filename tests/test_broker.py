@@ -284,6 +284,7 @@ class RecordingMetrics:
         self.heals: dict[tuple[str, str], float] = {}
         self.pending_heals: dict[str, int] = {}
         self.roster_refreshes: dict[tuple[str, str], float] = {}
+        self.calls: dict[tuple[str, str, str], float] = {}
 
     def set_upstream_ready(self, name: str, ready: bool) -> None:
         self.ready[name] = 1.0 if ready else 0.0
@@ -330,6 +331,10 @@ class RecordingMetrics:
     def inc_roster_refresh(self, name: str, outcome: str) -> None:
         key = (name, outcome)
         self.roster_refreshes[key] = self.roster_refreshes.get(key, 0.0) + 1.0
+
+    def inc_call(self, name: str, outcome: str, cause: str) -> None:
+        key = (name, outcome, cause)
+        self.calls[key] = self.calls.get(key, 0.0) + 1.0
 
 
 # One recorder per module run; each test uses its own upstream name, matching how
@@ -1045,3 +1050,82 @@ async def test_probe_502_after_ready_still_counts_an_exit() -> None:
 
     assert m.exits == {("workspace-tool-zoho", "probe_unreachable"): 1.0}
     assert m.probes.get(("workspace-tool-zoho", "http_error")) == 1.0
+
+
+# --- inc_call: the per-call outcome axis, exactly once per Upstream.call ----
+#
+# workspace_mcp_tool_calls_total (the bridge's own counter) only sees ok/error
+# from a tool_result several layers up — it cannot tell a sidecar tool error
+# from an unreachable sidecar from a split MCP session. These four pin the one
+# call at each of Upstream.call's exit points.
+
+
+async def test_inc_call_records_ok_on_a_clean_success() -> None:
+    m = RecordingMetrics()
+    up = Upstream(_OFFICE, _URL, dialer=_FakeDialer(), metrics=m)
+    await up.call("convert", {"path": "/x.docx"})
+    assert m.calls == {(_OFFICE, "ok", "none"): 1.0}
+
+
+async def test_inc_call_records_tool_error_when_the_sidecar_answers_isError() -> None:
+    class _ErrorConn:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="bad arg")], isError=True
+            )
+
+    @contextlib.asynccontextmanager
+    async def _error_dialer(
+        url: str, *, headers: dict[str, str] | None = None
+    ) -> AsyncIterator[_ErrorConn]:
+        yield _ErrorConn()
+
+    m = RecordingMetrics()
+    up = Upstream(_OFFICE, _URL, dialer=_error_dialer, metrics=m)
+    result = await up.call("convert", {})
+    assert result.isError is True
+    # The sidecar answered — this is the TOOL saying no, not a broker/transport
+    # failure, so it must land in its own bucket, not the same one an
+    # unreachable sidecar would.
+    assert m.calls == {(_OFFICE, "tool_error", "none"): 1.0}
+
+
+async def test_inc_call_records_timeout_with_the_literal_timeout_cause() -> None:
+    class _WedgedConn:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+            await asyncio.Event().wait()  # never resolves — the wedged upstream
+            raise AssertionError("unreachable")
+
+    @contextlib.asynccontextmanager
+    async def _wedged_dialer(
+        url: str, *, headers: dict[str, str] | None = None
+    ) -> AsyncIterator[_WedgedConn]:
+        yield _WedgedConn()
+
+    m = RecordingMetrics()
+    up = Upstream(
+        _OFFICE,
+        _URL,
+        dialer=_wedged_dialer,
+        call_retries=2,
+        call_backoff_s=0.0,
+        call_timeout_s=0.05,
+        metrics=m,
+    )
+    await asyncio.wait_for(up.call("convert", {}), timeout=2.0)
+    assert m.calls == {(_OFFICE, "timeout", "timeout"): 1.0}
+
+
+async def test_inc_call_records_unavailable_with_the_probe_cause_on_a_split_session() -> None:
+    """The prod shape this axis exists for: a multi-replica sidecar answers 404
+    (session_unknown) to a token another replica now owns. The retry loop
+    breaks out early on that definitive answer (no budget spent re-dialing),
+    and the outcome/cause pair must name the split, not read as a generic
+    outage a caller would blind-retry against."""
+    dialer = _SwitchDialer()
+    dialer.fail_with = _mcp_client_404()
+    m = RecordingMetrics()
+    up = Upstream("workspace-tool-docs", _URL, dialer=dialer, call_backoff_s=0.0, metrics=m)
+    result = await up.call("docs_search", {})
+    assert result.isError is True
+    assert m.calls == {("workspace-tool-docs", "unavailable", "session_unknown"): 1.0}

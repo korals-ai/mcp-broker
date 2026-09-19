@@ -447,6 +447,14 @@ class Upstream:
                 # broker never re-probes a ready upstream, so without this the
                 # gauge could stay 0 after a transient blip recovered.
                 self._set_reachable(True, reason="call_ok")
+                # isError is the sidecar reaching the tool and the TOOL saying no
+                # (bad argument, downstream 4xx) — not a broker/transport failure,
+                # so it gets its own outcome rather than folding into "ok".
+                self._metrics.inc_call(
+                    self._name,
+                    outcome="tool_error" if result.isError else "ok",
+                    cause="none",
+                )
                 return result
             except TimeoutError:
                 log.warning(
@@ -459,6 +467,7 @@ class Upstream:
                 # gauge/counter path a ready→OOMed sidecar surfaces through
                 # (probe() never re-runs for a ready upstream).
                 self._set_reachable(False, reason="call_timeout")
+                self._metrics.inc_call(self._name, outcome="timeout", cause="timeout")
                 return self._unavailable(
                     f"did not respond within {self._call_timeout_s:.0f}s (it may be wedged)"
                 )
@@ -475,6 +484,11 @@ class Upstream:
         )
         unknown = last_exc is not None and classify_probe_result(last_exc) == "session_unknown"
         self._set_reachable(False, reason="call_session_unknown" if unknown else "call_unreachable")
+        self._metrics.inc_call(
+            self._name,
+            outcome="unavailable",
+            cause=classify_probe_result(last_exc) if last_exc is not None else "unknown",
+        )
         return self._unavailable(
             f"not reachable after {self._call_retries + 1} attempts; it may be starting or restarting"
         )

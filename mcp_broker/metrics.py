@@ -5,14 +5,19 @@ calls a :class:`BrokerMetrics` you hand it; the default does nothing, so the
 library has no opinion about Prometheus, OpenTelemetry, statsd, or logs.
 
 Pass your own to :meth:`ToolBroker.from_env` (or construct :class:`Upstream`
-with it) and adapt each call onto whatever you already run. The three counters
-that matter operationally:
+with it) and adapt each call onto whatever you already run. The counters that
+matter operationally:
 
 * ``upstream_ready`` — is this upstream currently reachable. The single most
   useful series: a tool silently missing from the agent is this going 0.
 * ``upstream_giveup`` — the dial loop hit its backoff cap and stopped. An
   upstream that will now never appear without a restart.
 * ``upstream_exit`` — a live upstream dropped, with a reason.
+* ``call`` — the per-tool-call outcome (ok / tool_error / unavailable /
+  timeout, plus a ``cause`` on the failure outcomes). The other three answer
+  "is this upstream up"; this one answers "what happened to THIS call",
+  which is what tells a sidecar-side tool error apart from a broker-side
+  routing failure.
 """
 
 from __future__ import annotations
@@ -132,6 +137,36 @@ class BrokerMetrics(Protocol):
         its predecessor's schemas advertised for the workspace pod's whole
         life, and nothing counted it (2026-09-14)."""
 
+    def inc_call(self, name: str, outcome: str, cause: str) -> None:
+        """One ``Upstream.call`` to ``name`` finished — every exit path, exactly
+        once. A host that only counts ok/error at its own bridge (a tool_result
+        ``is_error`` observed several layers up) cannot tell "the sidecar
+        answered with an error" from "the sidecar was unreachable" from "the
+        MCP session was split across replicas" (a multi-replica sidecar
+        answering 404 for a session a DIFFERENT replica created) — three failure
+        classes with three different fixes that collapsed into one bool.
+
+        ``outcome``:
+
+        * ``ok``          — the call reached the sidecar; the result was not
+          ``isError``.
+        * ``tool_error``  — the call reached the sidecar; the TOOL itself
+          answered ``isError`` (a bad argument, a downstream 4xx, ...). The
+          broker/transport is not at fault.
+        * ``unavailable`` — the retry budget was exhausted, or the loop broke
+          out early on a definitive answer (a 404 session-unknown). The
+          sidecar could not be reached this call, or no longer holds this
+          session.
+        * ``timeout``      — the dial connected but the call never answered
+          within ``call_timeout_s`` (a wedged upstream).
+
+        ``cause`` narrows the failure outcomes: for ``unavailable`` it is
+        :func:`classify_probe_result` run on the last exception seen
+        (``session_unknown`` is the split-session/multi-replica signature this
+        axis exists to catch); for ``timeout`` it is the literal string
+        ``"timeout"``; for ``ok`` / ``tool_error`` it is ``"none"`` — nothing
+        failed, so nothing to classify."""
+
 
 class NullMetrics:
     """The default: report nothing.
@@ -180,6 +215,9 @@ class NullMetrics:
         return None
 
     def inc_roster_refresh(self, name: str, outcome: str) -> None:
+        return None
+
+    def inc_call(self, name: str, outcome: str, cause: str) -> None:
         return None
 
 
