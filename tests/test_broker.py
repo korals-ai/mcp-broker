@@ -193,6 +193,62 @@ async def test_upstream_persistent_unreachable_escalates_to_warning(
     assert _URL in msg and "STILL unreachable" in msg  # the dial target is in the log
 
 
+_TICKET = "eyJleHBpcnkiOjE3ODk5NTIyNzcsInNpZyI6ImFiYyIsInRlbmFudCI6InQiLCJ1c2VyIjoidSIsInYiOjN9"
+
+
+class _FakeDialerQuotingTheUrl(_FakeDialer):
+    """Fails like the real client library does: the exception message quotes
+    the full dial URL (``httpx.HTTPStatusError`` renders ``for url '...'``)."""
+
+    @contextlib.asynccontextmanager
+    async def __call__(
+        self, url: str, *, headers: dict[str, str] | None = None
+    ) -> AsyncIterator[_FakeConn]:
+        self.dials += 1
+        if self.dials <= self.fail_first:
+            raise ConnectionError(f"Client error '403 Forbidden' for url '{url}'")
+        yield _FakeConn(self)
+
+
+async def test_a_bearer_segment_in_the_upstream_url_never_reaches_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A per-session upstream carries the session's signed ticket as a path
+    # segment — a bearer for that user's credentials until it expires. The
+    # escalation WARNING, the recovery INFO and the call-failure WARNING all
+    # render the URL (or an exception quoting it); the segment must be
+    # redacted in every one of them, and the host:port must survive so the
+    # blackhole diagnosis those lines exist for still works.
+    url = f"http://ws-tool-connectors-t:9201/mcp/{_TICKET}"
+    # N failed probes (the escalation WARNING), then a call whose every
+    # attempt fails (the call-failure WARNING quoting the exception), then a
+    # probe that succeeds (the recovery INFO).
+    call_attempts = 4
+    up = Upstream(
+        "workspace-tool-odoo",
+        url,
+        dialer=_FakeDialerQuotingTheUrl(fail_first=_UNREACHABLE_WARN_AFTER + call_attempts),
+        metrics=METRICS,
+        call_retries=call_attempts - 1,
+        call_backoff_s=0.0,
+    )
+    caplog.set_level(logging.DEBUG, logger="workspace.tool_broker")
+
+    for _ in range(_UNREACHABLE_WARN_AFTER):
+        await up.probe()
+    result = await up.call("convert", {}, chat_id=None)
+    assert result.isError
+    await up.probe()  # recovers
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("STILL unreachable" in m for m in messages), messages
+    assert any("failed after retries" in m for m in messages), messages
+    assert any("reachable again" in m for m in messages), messages
+    for msg in messages:
+        assert _TICKET not in msg, msg
+    assert any("ws-tool-connectors-t:9201/mcp/<redacted>" in m for m in messages), messages
+
+
 async def test_upstream_recovery_after_escalation_logs_info(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -42,7 +42,7 @@ from starlette.types import ASGIApp
 from mcp_broker.dialer import Dialer, default_dialer
 from mcp_broker.metrics import NULL_METRICS, BrokerMetrics
 from mcp_broker.result_filter import NULL_RESULT_FILTER, ResultFilter, withheld_result
-from mcp_broker.upstream import Upstream
+from mcp_broker.upstream import Upstream, redact_url
 
 log = logging.getLogger("workspace.tool_broker")
 
@@ -350,7 +350,7 @@ class ToolBroker:
             "notified_sessions=%d notified_this_token=%d",
             name,
             self._token_chat.get(token, "-"),
-            url,
+            redact_url(url),
             up.ready,
             notified,
             matched,

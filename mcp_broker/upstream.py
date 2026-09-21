@@ -28,6 +28,7 @@ import errno
 import hashlib
 import json
 import logging
+import re
 import socket
 import uuid
 from typing import Any
@@ -139,6 +140,22 @@ def classify_probe_result(exc: BaseException | None) -> str:
 # leaving the tool missing from the agent. Sized past a normal cold start (a few
 # probe cycles). See docs/incidents/2026-07-27-workspace-egress-fence-*.
 _UNREACHABLE_WARN_AFTER = 3
+
+# A per-session upstream URL may carry a bearer as a path segment (the embedder
+# appends a signed, expiring ticket to route the session's calls), and the
+# dial exceptions the client library raises render the full URL in their
+# message. Anything logged about a URL goes through here: a long base64url
+# segment is replaced, never printed. Purely lexical — the broker does not
+# know what the segment means, only that a 32+ char token-shaped segment in a
+# log line is a bearer until proven otherwise.
+_BEARER_SEGMENT = re.compile(r"/[A-Za-z0-9_-]{32,}(?=[/?#\s'\"]|$)")
+
+
+def redact_url(text: str) -> str:
+    """``text`` (a URL, or an error message quoting one) with every
+    token-shaped path segment replaced by ``<redacted>``."""
+    return _BEARER_SEGMENT.sub("/<redacted>", text)
+
 
 # Sent on every tool call so a slow/failing turn can be grepped for by the SAME
 # id in both the platform's own logs and an external provider's (see the docstring
@@ -368,12 +385,15 @@ class Upstream:
                 "broker upstream %s STILL unreachable after %d probes (url=%s): %s",
                 self._name,
                 n,
-                self._url,
-                detail,
+                redact_url(self._url),
+                redact_url(detail),
             )
         else:
             log.debug(
-                "broker upstream %s not reachable yet (url=%s): %s", self._name, self._url, detail
+                "broker upstream %s not reachable yet (url=%s): %s",
+                self._name,
+                redact_url(self._url),
+                redact_url(detail),
             )
 
     def _note_probe_success(self) -> None:
@@ -384,7 +404,7 @@ class Upstream:
                 "broker upstream %s reachable again after %d failed probes (url=%s)",
                 self._name,
                 self._consecutive_probe_failures,
-                self._url,
+                redact_url(self._url),
             )
         self._consecutive_probe_failures = 0
 
@@ -480,7 +500,10 @@ class Upstream:
                 if attempt < self._call_retries:
                     await asyncio.sleep(self._call_backoff_s * (attempt + 1))
         log.warning(
-            "broker upstream %s call %s failed after retries: %s", self._name, tool_name, last_exc
+            "broker upstream %s call %s failed after retries: %s",
+            self._name,
+            tool_name,
+            redact_url(str(last_exc)),
         )
         unknown = last_exc is not None and classify_probe_result(last_exc) == "session_unknown"
         self._set_reachable(False, reason="call_session_unknown" if unknown else "call_unreachable")
